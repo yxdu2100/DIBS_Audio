@@ -15,7 +15,15 @@ DIBS/
 
 ## Data collection
 
-The phone app finds the board (advertises as `DIBS`). **Start / Stop** runs a
+Each board advertises as **`DIBS-XXXX`**, XXXX being the low 16 bits of
+its nRF52832 FICR device ID (the same digits end the `boardID` in
+session.json). In the app, tap the connection row to open **Choose Board**:
+it lists nearby boards with signal strength; the chosen one is remembered
+and reconnected automatically (also with the app in the background), and
+each session.json records its `boardName`. A parked board does not
+advertise, so move it to make it appear.
+
+The phone app connects to the chosen board. **Start / Stop** runs a
 session: the board records the microphone and the IMU together and streams
 both; the LED blinks every 2 s while recording. The app saves each session as
 a folder (Files app › DIBS_AUDIO › Sessions, or export as .zip):
@@ -104,8 +112,8 @@ doesn't work in the simulator. The app keeps receiving with the screen locked
 - `tools/flash_rtt.sh [seconds]` flashes `firmware/build`, then prints the RTT
   log; `--read` prints the log of the running board.
 - `tools/mac_ble_test/build.sh` builds `dibs_mactest` from the app's own BLE,
-  storage and alignment code; run `dibs_mactest <dir> <seconds>` in a
-  Terminal to record a session from the Mac.
+  storage and alignment code; run `dibs_mactest <dir> <seconds> [DIBS-XXXX]`
+  in a Terminal to record a session from the Mac.
 - `tools/tap_check.py` checks audio/IMU alignment on a session with taps.
 
 ## Hardware

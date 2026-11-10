@@ -1,14 +1,16 @@
 import Foundation
 
 // Runs the iOS app's BLE, storage and alignment code on a Mac:
-//   dibs_mactest <output dir> [seconds]
-// Connects to the board, records one session, saves it like the app does and
-// prints a summary.
+//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS-A05D]
+// Selects the named board (or the first one found), records one session,
+// saves it like the app does and prints a summary.
 let args = CommandLine.arguments
 let outDir = URL(fileURLWithPath: args.count > 1 ? args[1] : FileManager.default.currentDirectoryPath)
 let seconds = args.count > 2 ? Double(args[2]) ?? 5 : 5
+let wantedBoard = args.count > 3 ? args[3] : nil
 let store = RecordingStore(directory: outDir)
 let ble = DIBSBLEManager()
+ble.startBrowsing()
 var started = false
 var lastState: DIBSBLEManager.ConnectionState?
 
@@ -47,8 +49,14 @@ ble.onRecordingFinished = { capture in
 
 Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
     MainActor.assumeIsolated {
+        if let board = ble.nearbyBoards.first(where: { wantedBoard == nil || $0.name == wantedBoard }),
+           ble.selectedBoardID != board.id, !started,
+           wantedBoard != nil || ble.selectedBoardID == nil {
+            print("selecting", board.name)
+            ble.select(board)
+        }
         if ble.connectionState != lastState {
-            print("state:", ble.connectionState, ble.lastError ?? "")
+            print("state:", ble.connectionState, ble.selectedBoardName ?? "", ble.lastError ?? "")
             lastState = ble.connectionState
         }
         if ble.isReady && !started {

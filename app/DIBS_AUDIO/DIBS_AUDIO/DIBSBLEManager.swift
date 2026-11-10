@@ -1,17 +1,28 @@
 import CoreBluetooth
 import Foundation
 
-/// Finds the DIBS board, starts/stops sessions and collects the streamed
-/// audio and IMU data.
+/// A DIBS board seen advertising nearby.
+struct DiscoveredBoard: Identifiable, Equatable {
+    /// CoreBluetooth identifier (stable per phone, not across phones).
+    let id: UUID
+    /// "DIBS-XXXX", XXXX from the board's FICR device ID.
+    var name: String
+    var rssi: Int
+    var lastSeen: Date
+}
+
+/// Finds DIBS boards, connects to the one the user chose, starts/stops
+/// sessions and collects the streamed audio and IMU data.
 @Observable
 final class DIBSBLEManager: NSObject {
     enum ConnectionState: Equatable {
-        case poweredOff, unauthorized, scanning, connecting, connected
+        case poweredOff, unauthorized, noBoardSelected, scanning, connecting, connected
     }
 
     /// Data collected for the session in progress.
     struct Capture {
         var startedAt = Date()
+        var boardName: String?
         var samples: [Int16] = []
         var receivedPackets = 0
         var lostPackets = 0
@@ -32,6 +43,10 @@ final class DIBSBLEManager: NSObject {
     }
 
     private(set) var connectionState: ConnectionState = .poweredOff
+    private(set) var discoveredBoards: [DiscoveredBoard] = []
+    /// The board this phone records from, remembered across launches.
+    private(set) var selectedBoardID: UUID?
+    private(set) var selectedBoardName: String?
     private(set) var isRecording = false
     private(set) var capture: Capture?
     private(set) var battery: DIBSBattery?
@@ -40,21 +55,79 @@ final class DIBSBLEManager: NSObject {
     /// Called with the finished capture once the board confirms it stopped.
     var onRecordingFinished: ((Capture) -> Void)?
 
+    private enum DefaultsKey {
+        static let boardID = "DIBS.selectedBoardID"
+        static let boardName = "DIBS.selectedBoardName"
+    }
+
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
     private var control: CBCharacteristic?
     private var stopTimeout: Task<Void, Never>?
+    /// The device list wants live RSSI updates (picker open).
+    private var browsing = false
 
     override init() {
         super.init()
+        let defaults = UserDefaults.standard
+        selectedBoardID = defaults.string(forKey: DefaultsKey.boardID).flatMap(UUID.init)
+        selectedBoardName = defaults.string(forKey: DefaultsKey.boardName)
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
     var isReady: Bool { connectionState == .connected && control != nil }
 
+    /// Boards seen in the last 10 s, strongest first.
+    var nearbyBoards: [DiscoveredBoard] {
+        let cutoff = Date().addingTimeInterval(-10)
+        return discoveredBoards.filter { $0.lastSeen > cutoff || $0.id == selectedBoardID }
+            .sorted { $0.rssi > $1.rssi }
+    }
+
+    /// Lists nearby boards for the picker, with RSSI updates.
+    func startBrowsing() {
+        browsing = true
+        updateScanning()
+    }
+
+    func stopBrowsing() {
+        browsing = false
+        updateScanning()
+    }
+
+    /// Records from `board` from now on. Refused while recording.
+    @discardableResult
+    func select(_ board: DiscoveredBoard) -> Bool {
+        guard !isRecording else { return false }
+        guard board.id != selectedBoardID else { return true }
+        selectedBoardID = board.id
+        selectedBoardName = board.name
+        UserDefaults.standard.set(board.id.uuidString, forKey: DefaultsKey.boardID)
+        UserDefaults.standard.set(board.name, forKey: DefaultsKey.boardName)
+        lastError = nil
+        if let peripheral {
+            // Connect to the new board once the old link is down.
+            central.cancelPeripheralConnection(peripheral)
+        } else {
+            connectSelected()
+        }
+        return true
+    }
+
+    /// Stops using the selected board on this phone.
+    func forgetBoard() {
+        guard !isRecording else { return }
+        selectedBoardID = nil
+        selectedBoardName = nil
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.boardID)
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.boardName)
+        if let peripheral { central.cancelPeripheralConnection(peripheral) }
+        updateScanning()
+    }
+
     func startRecording() {
         guard isReady, !isRecording else { return }
-        capture = Capture()
+        capture = Capture(boardName: selectedBoardName)
         isRecording = true
         lastError = nil
         send(DIBSProtocol.commandStart)
@@ -88,9 +161,37 @@ final class DIBSBLEManager: NSObject {
         capture = nil
     }
 
-    private func startScanning() {
-        connectionState = .scanning
-        central.scanForPeripherals(withServices: [DIBSProtocol.serviceUUID])
+    /// Asks iOS to connect to the selected board. A pending connect needs no
+    /// scan and completes whenever the board advertises, also in background.
+    private func connectSelected() {
+        guard central.state == .poweredOn, peripheral == nil else { return }
+        guard let id = selectedBoardID else {
+            connectionState = .noBoardSelected
+            updateScanning()
+            return
+        }
+        if let known = central.retrievePeripherals(withIdentifiers: [id]).first {
+            peripheral = known
+            known.delegate = self
+            connectionState = .connecting
+            central.connect(known)
+        } else {
+            // Not known to this phone yet: wait for an advertisement.
+            connectionState = .scanning
+        }
+        updateScanning()
+    }
+
+    /// Scans while the picker is open or while no board is connected.
+    private func updateScanning() {
+        guard central.state == .poweredOn else { return }
+        if browsing || peripheral == nil || connectionState != .connected {
+            central.scanForPeripherals(
+                withServices: [DIBSProtocol.serviceUUID],
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: browsing])
+        } else {
+            central.stopScan()
+        }
     }
 
     private func handleAudio(_ data: Data) {
@@ -149,19 +250,38 @@ final class DIBSBLEManager: NSObject {
 extension DIBSBLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
-        case .poweredOn: startScanning()
+        case .poweredOn: connectSelected()
         case .unauthorized: connectionState = .unauthorized
-        default: connectionState = .poweredOff
+        default:
+            connectionState = .poweredOff
+            peripheral = nil
+            control = nil
         }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        central.stopScan()
-        self.peripheral = peripheral
-        peripheral.delegate = self
-        connectionState = .connecting
-        central.connect(peripheral)
+        let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+            ?? peripheral.name ?? "DIBS"
+        let rssi = RSSI.intValue == 127 ? -127 : RSSI.intValue  // 127: not available
+        let board = DiscoveredBoard(id: peripheral.identifier, name: name, rssi: rssi,
+                                    lastSeen: Date())
+        if let i = discoveredBoards.firstIndex(where: { $0.id == board.id }) {
+            discoveredBoards[i] = board
+        } else {
+            discoveredBoards.append(board)
+        }
+
+        if peripheral.identifier == selectedBoardID, self.peripheral == nil {
+            if selectedBoardName != name {
+                selectedBoardName = name
+                UserDefaults.standard.set(name, forKey: DefaultsKey.boardName)
+            }
+            self.peripheral = peripheral
+            peripheral.delegate = self
+            connectionState = .connecting
+            central.connect(peripheral)
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -171,7 +291,8 @@ extension DIBSBLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
         lastError = error?.localizedDescription
-        startScanning()
+        self.peripheral = nil
+        connectSelected()
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
@@ -182,7 +303,8 @@ extension DIBSBLEManager: CBCentralManagerDelegate {
         battery = nil
         self.peripheral = nil
         if let error { lastError = error.localizedDescription }
-        startScanning()
+        // Reconnects to the same board, or to a newly selected one.
+        connectSelected()
     }
 }
 
@@ -211,6 +333,7 @@ extension DIBSBLEManager: CBPeripheralDelegate {
             }
         }
         connectionState = .connected
+        updateScanning()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,

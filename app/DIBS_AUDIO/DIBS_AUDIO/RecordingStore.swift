@@ -87,6 +87,8 @@ struct SessionMetadata: Codable {
     var startedAt: Date
     var endedAt: Date
     var boardID: String
+    /// Advertised name, "DIBS-XXXX" (absent in sessions saved before it).
+    var boardName: String?
     var firmwareVersion: String
     var resetReason: String
     var sessionID: String
@@ -172,6 +174,7 @@ final class RecordingStore {
             startedAt: capture.startedAt,
             endedAt: Date(),
             boardID: status.map { String(format: "%016llX", $0.boardID) } ?? "unknown",
+            boardName: capture.boardName,
             firmwareVersion: status.map { "\($0.firmwareVersion >> 8).\($0.firmwareVersion & 0xFF)" } ?? "unknown",
             resetReason: status.map { String(format: "0x%08X", $0.resetReason) } ?? "unknown",
             sessionID: status.map { String(format: "%08X", $0.sessionID) } ?? "unknown",

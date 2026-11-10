@@ -36,7 +36,7 @@ struct SessionDetailView: View {
                     LabeledContent("Audio", value: String(format: "%.3f Hz, %d samples",
                                                           m.audio.sampleRateHz, m.audio.samples))
                     LabeledContent("IMU", value: "\(m.imu.samples) samples, ±\(m.imu.accelRangeG) g, ±\(m.imu.gyroRangeDPS) dps")
-                    LabeledContent("Board", value: "\(m.boardID) · fw \(m.firmwareVersion)")
+                    LabeledContent("Board", value: "\(m.boardName ?? m.boardID) · fw \(m.firmwareVersion)")
                     LabeledContent("Ended by", value: m.endReason)
                 }
 

@@ -5,12 +5,16 @@ struct ContentView: View {
     @Environment(RecordingStore.self) private var store
     @Environment(AudioPlayer.self) private var player
     @State private var saveError: String?
+    @State private var showingBoards = false
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    ConnectionRow(state: ble.connectionState)
+                    Button { showingBoards = true } label: {
+                        ConnectionRow(state: ble.connectionState, boardName: ble.selectedBoardName)
+                    }
+                    .foregroundStyle(.primary)
                     if let battery = ble.battery {
                         BatteryRow(battery: battery)
                     }
@@ -41,6 +45,7 @@ struct ContentView: View {
             }
             .navigationTitle("DIBS Audio")
             .navigationDestination(for: Recording.self) { SessionDetailView(recording: $0) }
+            .sheet(isPresented: $showingBoards) { BoardPickerView() }
             .toolbar { EditButton() }
         }
         .onAppear {
@@ -58,6 +63,7 @@ struct ContentView: View {
 
 private struct ConnectionRow: View {
     let state: DIBSBLEManager.ConnectionState
+    let boardName: String?
 
     var body: some View {
         HStack {
@@ -65,16 +71,22 @@ private struct ConnectionRow: View {
             Text(label)
             Spacer()
             if state == .scanning || state == .connecting { ProgressView() }
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
         }
+        .contentShape(Rectangle())
     }
 
     private var label: String {
-        switch state {
+        let board = boardName ?? "DIBS"
+        return switch state {
         case .poweredOff: "Bluetooth is off"
         case .unauthorized: "Bluetooth permission needed"
-        case .scanning: "Looking for DIBS…"
-        case .connecting: "Connecting…"
-        case .connected: "Connected to DIBS"
+        case .noBoardSelected: "Choose a board"
+        case .scanning: "Looking for \(board)…"
+        case .connecting: "Connecting to \(board)…"
+        case .connected: "Connected to \(board)"
         }
     }
 
@@ -82,6 +94,7 @@ private struct ConnectionRow: View {
         switch state {
         case .connected: .green
         case .scanning, .connecting: .orange
+        case .noBoardSelected: .blue
         default: .red
         }
     }

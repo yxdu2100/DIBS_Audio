@@ -1,5 +1,7 @@
 #include "ble.h"
 
+#include <string.h>
+
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -112,9 +114,12 @@ static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, DIBS_UUID_SERVICE),
 };
 
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+/* "DIBS-XXXX", XXXX = low 16 bits of the FICR device ID, so several boards
+ * can be told apart in the phone's device list. */
+static char device_name[sizeof("DIBS-XXXX")];
+
+static struct bt_data sd[] = {
+	BT_DATA(BT_DATA_NAME_COMPLETE, device_name, 0),
 };
 
 /* 1.00-1.08 s: slow enough to cost little, and iOS still finds the board
@@ -148,7 +153,7 @@ static void advertise(void)
 		 * calls advertise() again. */
 		LOG_WRN("advertising failed: %d", err);
 	} else {
-		LOG_INF("advertising as \"%s\"", CONFIG_BT_DEVICE_NAME);
+		LOG_INF("advertising as \"%s\"", device_name);
 	}
 }
 
@@ -219,11 +224,19 @@ static struct bt_gatt_cb gatt_callbacks = {
 
 int ble_init(void)
 {
+	snprintk(device_name, sizeof(device_name), "DIBS-%04X",
+		 (uint16_t)NRF_FICR->DEVICEID[0]);
+	sd[0].data_len = strlen(device_name);
+
 	int err = bt_enable(NULL);
 
 	if (err) {
 		LOG_ERR("bt_enable: %d", err);
 		return err;
+	}
+	err = bt_set_name(device_name);
+	if (err) {
+		LOG_WRN("bt_set_name: %d", err);
 	}
 	bt_gatt_cb_register(&gatt_callbacks);
 	advertise();
