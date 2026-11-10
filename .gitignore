@@ -1,0 +1,6 @@
+build*/
+firmware/build*/
+.DS_Store
+xcuserdata/
+DerivedData/
+tools/mac_ble_test/dibs_mactest

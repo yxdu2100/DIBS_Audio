@@ -1,0 +1,12 @@
+config DIBS_OPEN_DEBUG_PORT
+	bool "Keep the SWD debug port open"
+	default y
+	help
+	  The board uses nRF52832 build code G (Rev 3), whose debug port is
+	  locked after every reset unless UICR.APPROTECT is HwDisabled (0x5A).
+	  With it locked, the next J-Link/nrfutil connection has to recover
+	  (erase) the chip, so RTT and debugging stop working after the first
+	  reset. When enabled, the board writes 0x5A to UICR.APPROTECT on the
+	  first boot and resets once.
+
+	  Turn this off for production firmware.

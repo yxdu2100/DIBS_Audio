@@ -1,0 +1,15 @@
+identifier: dibs/nrf52832
+name: DIBS nRF52832
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+ram: 64
+flash: 512
+supported:
+  - ble
+  - gpio
+  - i2c
+  - pdm
+  - watchdog

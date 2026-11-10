@@ -1,0 +1,13 @@
+if BOARD_DIBS
+
+config HW_STACK_PROTECTION
+	default ARCH_HAS_STACK_PROTECTION
+
+config I2C
+	default y if SENSOR || CHARGER || FUEL_GAUGE
+
+# Room for the boot log until an RTT viewer attaches.
+config SEGGER_RTT_BUFFER_SIZE_UP
+	default 4096
+
+endif # BOARD_DIBS

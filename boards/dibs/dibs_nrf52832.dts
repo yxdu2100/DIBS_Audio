@@ -1,0 +1,139 @@
+/*
+ * DIBS board (KiCad project dibs_nrf52_v21)
+ *
+ *   U1   nRF52832-CIAA (WLCSP), VDD = 1.8 V from PS1 TPS82740
+ *   MK2  ICS-41350 PDM mic    CLK P0.16, DATA P0.15, SELECT = GND (left)
+ *   U2   LSM6DSV32X IMU        I2C 0x6B, INT1 P0.28 (schematic says 16X)
+ *   U3   BQ25180 charger       I2C 0x6A
+ *   U4   MAX17048 fuel gauge   I2C 0x36, ALRT P0.08
+ *   D1   green LED             VBAT -> R3 -> D1 -> Q1, gate P0.18
+ *   Y1   32 MHz, Y2 32.768 kHz crystals
+ *   J1   SWD (SWDIO, SWDCLK, +1V8, GND, VBUS); J1 NRST is not routed to P0.21
+ */
+
+/dts-v1/;
+#include <nordic/nrf52832_ciaa.dtsi>
+#include "dibs_nrf52832-pinctrl.dtsi"
+#include <zephyr/dt-bindings/sensor/lsm6dsv16x.h>
+
+/ {
+	model = "DIBS nRF52832";
+	compatible = "dibs,dibs-nrf52832";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led0: led_0 {
+			/* Runs from VBAT: only lights with a battery connected. */
+			gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
+			label = "Green LED (D1)";
+		};
+	};
+
+	aliases {
+		led0 = &led0;
+		accel0 = &imu;
+		fuel-gauge0 = &fuel_gauge;
+		charger0 = &charger;
+		dmic0 = &pdm0;
+		watchdog0 = &wdt0;
+	};
+};
+
+/* DCC (B6) is not connected: there is no DC/DC inductor, so run from the LDO. */
+&reg {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&gpio0 {
+	status = "okay";
+	/* IMU INT1 (P0.28) uses the low-power SENSE mechanism. As a GPIOTE IN
+	 * channel it would keep the 16 MHz clock running and, with TWIM enabled,
+	 * hit nRF52832 anomaly 89: ~0.3 mA extra at the battery. */
+	sense-edge-mask = <(1 << 28)>;
+};
+
+/* TWIM0 shares its instance with SPIM0. */
+&spi0 {
+	status = "disabled";
+};
+
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	/* 4.7 k pull-ups (R1, R2) to 1.8 V. */
+	clock-frequency = <I2C_BITRATE_FAST>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* Fitted part is the LSM6DSV32X although the schematic symbol says 16X:
+	 * WHO_AM_I (0x70) is shared, but CTRL8 resets to 0x04 and the
+	 * sensitivity at range code 0 is 0.122 mg/LSB (+-4 g). SA0 = 1.8 V. */
+	imu: lsm6dsv32x@6b {
+		compatible = "st,lsm6dsv32x";
+		reg = <0x6b>;
+		int1-gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
+		drdy-pin = <1>;
+		accel-odr = <LSM6DSV16X_DT_ODR_AT_120Hz>;
+		gyro-odr = <LSM6DSV16X_DT_ODR_AT_120Hz>;
+	};
+
+	/* 30 mAh cell: 10 mA is ~0.33 C. */
+	charger: bq25180@6a {
+		compatible = "ti,bq25180";
+		reg = <0x6a>;
+		constant-charge-current-max-microamp = <10000>;
+		constant-charge-voltage-max-microvolt = <4200000>;
+	};
+
+	fuel_gauge: max17048@36 {
+		compatible = "maxim,max17048";
+		reg = <0x36>;
+	};
+};
+
+dmic_dev: &pdm0 {
+	status = "okay";
+	pinctrl-0 = <&pdm0_default>;
+	pinctrl-names = "default";
+	clock-source = "PCLK32M_HFXO";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0xc000>;
+		};
+
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000c000 0x37000>;
+		};
+
+		slot1_partition: partition@43000 {
+			label = "image-1";
+			reg = <0x00043000 0x37000>;
+		};
+
+		storage_partition: partition@7a000 {
+			label = "storage";
+			reg = <0x0007a000 0x00006000>;
+		};
+	};
+};
