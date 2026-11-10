@@ -127,6 +127,10 @@ final class DIBSBLEManager: NSObject {
 
     func startRecording() {
         guard isReady, !isRecording else { return }
+        if battery?.isLow == true {
+            lastError = "Battery low. Charge the board before recording."
+            return
+        }
         capture = Capture(boardName: selectedBoardName)
         isRecording = true
         lastError = nil
@@ -143,6 +147,15 @@ final class DIBSBLEManager: NSObject {
             guard !Task.isCancelled else { return }
             self?.finishRecording()
         }
+    }
+
+    /// Turns the board off for storage (charger shutdown mode, ~15 nA). Only
+    /// plugging in USB turns it back on. Refused while recording.
+    @discardableResult
+    func shutDownBoard() -> Bool {
+        guard isReady, !isRecording else { return false }
+        send(DIBSProtocol.commandShip)
+        return true
     }
 
     private func send(_ command: UInt8) {
@@ -239,6 +252,17 @@ final class DIBSBLEManager: NSObject {
             return
         }
         if isRecording { capture?.status = status }
+        if status.state == .idle, status.endReason == .lowBattery, isRecording {
+            lastError = "Recording stopped: battery low. Charge the board."
+            if (capture?.receivedPackets ?? 0) == 0 {
+                // Refused before any data: nothing to save.
+                isRecording = false
+                capture = nil
+                return
+            }
+            finishRecording()
+            return
+        }
         // Idle while we record: the board stopped (on request or on its own).
         if status.state == .idle, isRecording,
            stopTimeout != nil || (capture?.receivedPackets ?? 0) > 0 {

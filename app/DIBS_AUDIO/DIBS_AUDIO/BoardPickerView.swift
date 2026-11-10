@@ -4,6 +4,7 @@ import SwiftUI
 struct BoardPickerView: View {
     @Environment(DIBSBLEManager.self) private var ble
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmShutdown = false
 
     var body: some View {
         NavigationStack {
@@ -42,10 +43,14 @@ struct BoardPickerView: View {
 
                     if ble.selectedBoardID != nil {
                         Section {
+                            Button("Turn off for storage") { confirmShutdown = true }
+                                .disabled(!ble.isReady || ble.isRecording)
                             Button("Forget \(ble.selectedBoardName ?? "this board")", role: .destructive) {
                                 ble.forgetBoard()
                             }
                             .disabled(ble.isRecording)
+                        } footer: {
+                            Text("Turning off puts the charger in shutdown mode: the battery is not drained while the board is stored. Plug in USB to turn it back on.")
                         }
                     }
                 }
@@ -56,6 +61,16 @@ struct BoardPickerView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .confirmationDialog("Turn off \(ble.selectedBoardName ?? "the board")?",
+                                isPresented: $confirmShutdown, titleVisibility: .visible) {
+                Button("Turn Off", role: .destructive) {
+                    if ble.shutDownBoard() { dismiss() }
+                }
+            } message: {
+                Text(ble.battery?.usbPresent == true
+                     ? "USB is connected: the board turns off when you unplug it. Plugging USB in again turns it back on."
+                     : "The board turns off now. Plug in USB to turn it back on.")
             }
             .onAppear { ble.startBrowsing() }
             .onDisappear { ble.stopBrowsing() }

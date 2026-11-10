@@ -13,6 +13,9 @@ enum DIBSProtocol {
 
     static let commandStop: UInt8 = 0x00
     static let commandStart: UInt8 = 0x01
+    /// Charger shutdown mode for storage; only USB wakes the board. With USB
+    /// present it takes effect when USB is removed.
+    static let commandShip: UInt8 = 0x02
 
     /// seq (u16) + predictor (i16) + step index (u8) + buffer end time (u32)
     static let audioHeaderLength = 9
@@ -35,7 +38,7 @@ struct DIBSStatus: Equatable, Codable {
     }
 
     enum EndReason: UInt8, Codable {
-        case none = 0, stop = 1, disconnect = 2, error = 3
+        case none = 0, stop = 1, disconnect = 2, error = 3, lowBattery = 4
     }
 
     var state: State
@@ -104,6 +107,10 @@ struct DIBSBattery: Equatable {
 
     var charge: Charge
     var usbPresent: Bool
+    /// On battery below ~3.3 V: the board stops and refuses sessions.
+    var isLow: Bool
+    /// Shutdown requested on USB: the board turns off when USB is removed.
+    var shutdownPending: Bool
     /// Fuel gauge estimate; the generic cell model can report a bit over 100.
     var stateOfCharge: Int
     var voltage: Double
@@ -112,6 +119,8 @@ struct DIBSBattery: Equatable {
         let b = [UInt8](data)
         guard b.count >= 6, b[0] == 1 else { return nil }
         usbPresent = b[1] & 0x01 != 0
+        isLow = b[1] & 0x02 != 0
+        shutdownPending = b[1] & 0x04 != 0
         charge = Charge(rawValue: b[2]) ?? .unknown
         stateOfCharge = Int(b[3])
         voltage = Double(UInt16(b[4]) | UInt16(b[5]) << 8) / 1000

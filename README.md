@@ -89,6 +89,26 @@ so look at the boards' rails: power +1V8 at J1 pin 4 directly from the PPK2
 (no battery) to split the 1.8 V loads (nRF, IMU, mic, pull-ups) from the
 VBAT side (BQ25180, MAX17048, TPS82740, D1/Q1).
 
+### Battery protection and storage
+
+On battery (USB absent) the board checks the cell every 5 s while a phone
+is connected, else once a minute (three readings in a row decide):
+
+| Cell | Action |
+|---|---|
+| < 3.30 V | stop the session (`endReason: lowBattery`), refuse new ones; app shows "Battery low" |
+| ≥ 3.45 V or USB in | sessions allowed again |
+| < 3.15 V | charger shutdown mode, ahead of the BQ25180's 3.0 V BUVLO cut-off |
+
+**Turn off for storage** (Choose Board sheet, BLE command 0x02) puts the
+BQ25180 in shutdown mode: ~15 nA from the cell, and only plugging in USB
+turns the board back on. With USB connected the request waits until USB is
+removed ("Turns off when unplugged").
+
+A deeply discharged cell (below 3.0 V) is pre-charged at a reduced current
+first; one that does not climb past 3.0 V within an hour or gets warm should
+be replaced.
+
 ### Robustness
 
 - Task watchdog over the hardware WDT: the system workqueue, the session

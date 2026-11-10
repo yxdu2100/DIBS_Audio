@@ -114,12 +114,19 @@ private struct BatteryRow: View {
                 .foregroundStyle(.secondary)
             Spacer()
             Text(label)
-                .foregroundStyle(battery.charge == .charging ? .green : .secondary)
+                .foregroundStyle(labelColor)
         }
     }
 
+    private var labelColor: Color {
+        if battery.shutdownPending || battery.isLow { return .orange }
+        return battery.charge == .charging ? .green : .secondary
+    }
+
     private var label: String {
-        switch battery.charge {
+        if battery.shutdownPending { return "Turns off when unplugged" }
+        if battery.isLow { return "Battery low" }
+        return switch battery.charge {
         case .charging: "Charging"
         case .full: "Charged"
         case .notCharging: "USB, not charging"

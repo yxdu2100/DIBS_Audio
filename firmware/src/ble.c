@@ -9,6 +9,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 
+#include "battery.h"
 #include "power.h"
 #include "protocol.h"
 #include "session.h"
@@ -43,6 +44,9 @@ static ssize_t control_write(struct bt_conn *conn, const struct bt_gatt_attr *at
 		break;
 	case DIBS_CMD_STOP:
 		session_stop(DIBS_END_STOP);
+		break;
+	case DIBS_CMD_SHIP:
+		battery_request_shutdown();
 		break;
 	default:
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);

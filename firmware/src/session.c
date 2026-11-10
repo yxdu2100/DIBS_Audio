@@ -12,6 +12,7 @@
 #include <zephyr/task_wdt/task_wdt.h>
 
 #include "audio.h"
+#include "battery.h"
 #include "ble.h"
 #include "imu.h"
 #include "power.h"
@@ -164,6 +165,13 @@ void session_init(uint32_t reset_reason)
 
 void session_start(void)
 {
+	if (battery_is_low()) {
+		LOG_WRN("session refused: battery low");
+		status.state = DIBS_STATE_IDLE;
+		status.end_reason = DIBS_END_LOW_BATTERY;
+		ble_set_status(&status);
+		return;
+	}
 	if (atomic_cas(&running, 0, 1)) {
 		atomic_set(&end_reason, DIBS_END_NONE);
 		k_sem_give(&start_sem);

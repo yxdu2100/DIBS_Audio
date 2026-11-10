@@ -2,7 +2,8 @@
  * DIBS BLE protocol v3, shared with app/DIBS_AUDIO/DIBS_AUDIO/DIBSProtocol.swift.
  *
  * Service   D1B50001-6E2B-4C1F-9A7D-3E8B5F0C2A41
- *   Control D1B50002-...  write:  0x01 start session, 0x00 stop
+ *   Control D1B50002-...  write:  0x01 start session, 0x00 stop,
+ *                                 0x02 shut down for storage (DIBS_CMD_SHIP)
  *   Audio   D1B50003-...  notify: audio packets (below)
  *   Status  D1B50004-...  read/notify: struct dibs_status
  *   Battery D1B50005-...  read/notify: struct dibs_battery, every 5 s on change
@@ -58,6 +59,9 @@
 
 #define DIBS_CMD_STOP  0x00
 #define DIBS_CMD_START 0x01
+/* Charger shutdown mode (15 nA from the cell); only plugging in USB wakes
+ * the board. With USB present it takes effect when USB is removed. */
+#define DIBS_CMD_SHIP  0x02
 
 #define DIBS_AUDIO_HDR_LEN 9
 
@@ -77,6 +81,7 @@ enum dibs_end_reason {
 	DIBS_END_STOP = 1,       /* stop command */
 	DIBS_END_DISCONNECT = 2, /* phone disconnected */
 	DIBS_END_ERROR = 3,
+	DIBS_END_LOW_BATTERY = 4, /* stopped, or a start refused, on low battery */
 };
 
 struct dibs_status {
@@ -112,6 +117,10 @@ enum dibs_charge {
 };
 
 #define DIBS_BATTERY_USB_PRESENT BIT(0)
+/* On battery below ~3.3 V: sessions are stopped and refused until charged. */
+#define DIBS_BATTERY_LOW         BIT(1)
+/* Shutdown requested while on USB: the board turns off when USB is removed. */
+#define DIBS_BATTERY_SHIP_PENDING BIT(2)
 
 struct dibs_battery {
 	uint8_t version;     /* 1 */
