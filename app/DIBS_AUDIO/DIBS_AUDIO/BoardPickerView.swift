@@ -37,7 +37,7 @@ struct BoardPickerView: View {
                     } header: {
                         Text("Nearby boards")
                     } footer: {
-                        Text("Each board advertises as DIBS-XXXX, from its chip ID. The board ID in every session.json ends with the same four digits.")
+                        Text("Each board advertises as DIBS_Audio-XXXX, from its chip ID. The board ID in every session.json ends with the same four digits.")
                     }
 
                     if ble.selectedBoardID != nil {

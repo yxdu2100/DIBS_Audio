@@ -79,7 +79,7 @@ private struct ConnectionRow: View {
     }
 
     private var label: String {
-        let board = boardName ?? "DIBS"
+        let board = boardName ?? "DIBS_Audio"
         return switch state {
         case .poweredOff: "Bluetooth is off"
         case .unauthorized: "Bluetooth permission needed"

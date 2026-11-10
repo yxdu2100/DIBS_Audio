@@ -87,7 +87,7 @@ struct SessionMetadata: Codable {
     var startedAt: Date
     var endedAt: Date
     var boardID: String
-    /// Advertised name, "DIBS-XXXX" (absent in sessions saved before it).
+    /// Advertised name, "DIBS_Audio-XXXX" (absent in sessions saved before it).
     var boardName: String?
     var firmwareVersion: String
     var resetReason: String

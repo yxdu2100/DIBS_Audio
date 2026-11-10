@@ -5,7 +5,7 @@ import Foundation
 struct DiscoveredBoard: Identifiable, Equatable {
     /// CoreBluetooth identifier (stable per phone, not across phones).
     let id: UUID
-    /// "DIBS-XXXX", XXXX from the board's FICR device ID.
+    /// "DIBS_Audio-XXXX", XXXX from the board's FICR device ID.
     var name: String
     var rssi: Int
     var lastSeen: Date
@@ -262,7 +262,7 @@ extension DIBSBLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-            ?? peripheral.name ?? "DIBS"
+            ?? peripheral.name ?? "DIBS_Audio"
         let rssi = RSSI.intValue == 127 ? -127 : RSSI.intValue  // 127: not available
         let board = DiscoveredBoard(id: peripheral.identifier, name: name, rssi: rssi,
                                     lastSeen: Date())

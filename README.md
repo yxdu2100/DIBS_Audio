@@ -8,15 +8,15 @@ DIBS/
 ├── boards/dibs/        Zephyr board definition, target dibs/nrf52832
 ├── firmware/           data-collection firmware (nRF Connect SDK application)
 ├── samples/bringup/    hardware bring-up test (LED, IMU, battery, mic level)
+├── samples/sleep_floor/  board init only, for measuring sleep current
 ├── app/DIBS_AUDIO/     iOS companion app (DIBS_AUDIO.xcodeproj)
-├── tools/              flash + RTT script, Mac BLE test, tap alignment check
-└── .vscode/            nRF Connect for VS Code settings (board root)
+└── tools/              flash + RTT script, Mac BLE test, tap alignment check
 ```
 
 ## Data collection
 
-Each board advertises as **`DIBS-XXXX`**, XXXX being the low 16 bits of
-its nRF52832 FICR device ID (the same digits end the `boardID` in
+Each board advertises as **`DIBS_Audio-XXXX`**, XXXX being the low 16
+bits of its nRF52832 FICR device ID (the same digits end the `boardID` in
 session.json). In the app, tap the connection row to open **Choose Board**:
 it lists nearby boards with signal strength; the chosen one is remembered
 and reconnected automatically (also with the app in the background), and
@@ -112,7 +112,7 @@ doesn't work in the simulator. The app keeps receiving with the screen locked
 - `tools/flash_rtt.sh [seconds]` flashes `firmware/build`, then prints the RTT
   log; `--read` prints the log of the running board.
 - `tools/mac_ble_test/build.sh` builds `dibs_mactest` from the app's own BLE,
-  storage and alignment code; run `dibs_mactest <dir> <seconds> [DIBS-XXXX]`
+  storage and alignment code; run `dibs_mactest <dir> <seconds> [DIBS_Audio-XXXX]`
   in a Terminal to record a session from the Mac.
 - `tools/tap_check.py` checks audio/IMU alignment on a session with taps.
 
@@ -133,7 +133,10 @@ I2C: SDA P0.03, SCL P0.04, 4.7 kΩ pull-ups to 1.8 V.
 
 ## Build and flash (VS Code)
 
-1. Open the `DIBS` folder in VS Code (nRF Connect SDK v3.1.1).
+1. Open the `DIBS` folder in VS Code (nRF Connect SDK v3.1.1). The board
+   lives in this repository, so add the folder as a board root: in
+   `.vscode/settings.json` (not tracked) set
+   `"nrf-connect.boardRoots": ["${workspaceFolder}"]`.
 2. nRF Connect → Applications → `firmware` (or `samples/bringup`) →
    **Add build configuration**,
    board target **`dibs/nrf52832`** (listed under custom boards).

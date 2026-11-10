@@ -4,3 +4,7 @@ firmware/build*/
 xcuserdata/
 DerivedData/
 tools/mac_ble_test/dibs_mactest
+
+# Local only: enclosure design files, editor settings
+enclosure/
+.vscode/

@@ -1,7 +1,7 @@
 import Foundation
 
 // Runs the iOS app's BLE, storage and alignment code on a Mac:
-//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS-A05D]
+//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS_Audio-A05D]
 // Selects the named board (or the first one found), records one session,
 // saves it like the app does and prints a summary.
 let args = CommandLine.arguments

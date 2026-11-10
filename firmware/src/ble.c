@@ -114,9 +114,10 @@ static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, DIBS_UUID_SERVICE),
 };
 
-/* "DIBS-XXXX", XXXX = low 16 bits of the FICR device ID, so several boards
- * can be told apart in the phone's device list. */
-static char device_name[sizeof("DIBS-XXXX")];
+/* "DIBS_Audio-XXXX", XXXX = low 16 bits of the FICR device ID, so several
+ * boards can be told apart in the phone's device list (15 characters: fits
+ * the scan response). */
+static char device_name[sizeof("DIBS_Audio-XXXX")];
 
 static struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, device_name, 0),
@@ -224,7 +225,7 @@ static struct bt_gatt_cb gatt_callbacks = {
 
 int ble_init(void)
 {
-	snprintk(device_name, sizeof(device_name), "DIBS-%04X",
+	snprintk(device_name, sizeof(device_name), "DIBS_Audio-%04X",
 		 (uint16_t)NRF_FICR->DEVICEID[0]);
 	sd[0].data_len = strlen(device_name);
 
