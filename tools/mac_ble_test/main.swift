@@ -1,15 +1,19 @@
 import Foundation
 
 // Runs the iOS app's BLE, storage and alignment code on a Mac:
-//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS_Audio-A05D]
+//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS_Audio-A05D | any] [std | hr | hrimu]
 // Selects the named board (or the first one found), records one session,
 // saves it like the app does and prints a summary.
 let args = CommandLine.arguments
 let outDir = URL(fileURLWithPath: args.count > 1 ? args[1] : FileManager.default.currentDirectoryPath)
 let seconds = args.count > 2 ? Double(args[2]) ?? 5 : 5
-let wantedBoard = args.count > 3 ? args[3] : nil
+let wantedBoard = args.count > 3 && args[3] != "any" ? args[3] : nil
+let mode: IMUMode = args.count < 5 ? .standard
+    : ["hr": .highRate, "hrimu": .highRateIMUOnly][args[4]] ?? .standard
 let store = RecordingStore(directory: outDir)
 let ble = DIBSBLEManager()
+ble.imuMode = mode
+ble.sessionsDirectory = store.directory
 ble.startBrowsing()
 var started = false
 var lastState: DIBSBLEManager.ConnectionState?
@@ -21,9 +25,16 @@ ble.onRecordingFinished = { capture in
         print(String(format: "audio: %.2f s @ %.3f Hz, %d packets, %d lost, %d dropped on board",
                      m.audio.durationSeconds, m.audio.sampleRateHz, m.audio.receivedPackets,
                      m.audio.lostPackets, m.audio.droppedOnBoard))
-        print(String(format: "imu:   %d samples (%.2f Hz), %d packets, %d lost, %d dropped, %d overruns, %d I2C errors",
-                     m.imu.samples, Double(m.imu.samples) / m.audio.durationSeconds, m.imu.packets,
-                     m.imu.lostPackets, m.imu.droppedOnBoard, m.imu.overruns, m.imu.i2cErrors))
+        print(String(format: "imu:   %@ mode, %d accel samples (%.2f Hz), %d packets, %d lost, %d dropped, %d overruns, %d I2C errors",
+                     "\(m.imu.mode ?? .standard)", m.imu.samples, Double(m.imu.samples) / m.audio.durationSeconds,
+                     m.imu.packets, m.imu.lostPackets, m.imu.droppedOnBoard, m.imu.overruns, m.imu.i2cErrors))
+        if m.imu.mode?.isHighRate == true {
+            print(String(format: "accel: %.3f Hz measured (wav %d Hz), %d zero-filled, timestamps: %@, %d rejected",
+                         m.imu.accelSampleRateHz ?? 0, m.imu.accelWavSampleRateHz ?? 0,
+                         m.imu.missingAccelSamples ?? 0,
+                         m.imu.accelTimestampFit.map { String(format: "%.4f ticks/sample, rms %.2f ticks, %d points", $0.slopeMicrosPerCount, $0.residualRMSMicros, $0.pointsUsed) } ?? "no fit",
+                         m.imu.accelTimestampsRejected ?? 0))
+        }
         if let f = m.audioClockFit {
             print(String(format: "audio clock: %.3f Hz measured (nominal %.3f, %+.0f ppm), %d anchors (%d rejected), residual rms %.1f us, max %.1f us",
                          m.audio.sampleRateHz, m.audio.nominalSampleRateHz,

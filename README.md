@@ -41,7 +41,61 @@ a folder (Files app › DIBS_AUDIO › Sessions, or export as .zip):
 - IMU: LSM6DSV32X accel ±8 g + gyro ±2000 dps at 120 Hz nominal (this
   part's oscillator runs ~1.3 % slow, ≈118.5 Hz), FIFO with timestamps
 - Link: 2M PHY, ATT MTU 247; 15–30 ms interval while recording
-- Protocol v3: `firmware/src/protocol.h` ↔ `app/DIBS_AUDIO/DIBS_AUDIO/DIBSProtocol.swift`
+- Protocol v4: `firmware/src/protocol.h` ↔ `app/DIBS_AUDIO/DIBS_AUDIO/DIBSProtocol.swift`
+
+### High-rate IMU mode
+
+The segmented control above **Start** picks the IMU mode for the next
+session (remembered by the app; `dibs_mactest ... <board|any> std|hr|hrimu`
+on the Mac):
+
+| Mode | Accelerometer | Gyroscope | Audio |
+|---|---|---|---|
+| IMU 120 Hz (standard) | 120 Hz | 120 Hz | 16 kHz |
+| 3.84k + mic (high-rate) | 3840 Hz nominal (≈3783 Hz measured) | 240 Hz | 16 kHz |
+| 3.84k, no mic (high-rate IMU only) | as above | 240 Hz | off |
+
+IMU-only sessions have no `audio.wav`; their `time_s` columns count seconds
+from the session start on the board's clock (`audio_index` is -1). To pair
+one with audio from a second board, tap both boards together at the start
+and end of the recording.
+
+High-rate sessions add these files (all other files as above; `imu_aligned.csv`
+then has one row per gyroscope sample, 240 Hz, with the accel sample of the
+same FIFO slot, so the app's chart and `tap_check.py` still work):
+
+| File | Content |
+|---|---|
+| `imu_accel.wav` | every accel sample, 3 channels x/y/z, raw 16-bit LSB (×`accelMicroGPerLSB`), at the measured rate; samples of lost packets are zeros |
+| `imu_accel_timestamps.csv` | the FIFO's IMU timestamps, one per 32 accel samples |
+| `imu_accel_timeline.csv` | accel index → `session_us` / `time_s` / `audio_index`; `np.interp` over it times every sample (exact between timestamps, split at FIFO overruns) |
+| `imu_gyro_raw.csv` | raw gyroscope samples with the accel index of their slot |
+
+`python3 tools/load_session.py "<session folder>"` loads audio and accel
+(either mode) onto the audio timeline.
+
+The IMU's first 100 ms are dropped on the board (both modes): right after
+power-up accel samples 1–2 are garbage (one saturated) and the gyroscope
+has a ~40 ms start-up transient of up to ~35 dps, the same in every session.
+The microphone drops its first 100 ms too, so both streams now begin ~0.1 s
+into the session, within a few ms of each other (time_s ≈ 0). Sessions recorded before 2026-11-12 still contain
+these samples.
+
+How it works: the FIFO is read in 36-row bursts (the TWIM's 255-byte limit),
+~4200 rows/s, about 2/3 of the 400 kHz I2C bus; the IMU timestamp is
+batched every 32 accel samples. Audio and IMU packets go through one send
+queue (`ble_tx_*` in `ble.c`), so a slow link drops packets (counted, and
+zero-filled by the app) instead of stalling the microphone or overflowing
+the IMU FIFO. The stream is ~33 kB/s (~150 notifications/s); high-rate
+sessions ask for a 15 ms connection interval and start the sensors once
+the phone has applied it (it takes ~3 s; at most 5 s), so the stream does
+not begin on the slower link.
+
+Measured 2026-11-11 with a MacBook as central (`dibs_mactest`): accel
+3782.9 Hz, timestamps exactly 12.000 ticks/sample, no FIFO overruns, but the
+Mac carries only ~2 packets per connection event, so **~17 % of audio and
+IMU packets were lost** (standard mode: 0 %). Check the loss on the iPhone
+before relying on high-rate data (Quality section of the session).
 
 ### How audio and IMU are aligned
 
@@ -108,6 +162,19 @@ removed ("Turns off when unplugged").
 A deeply discharged cell (below 3.0 V) is pre-charged at a reduced current
 first; one that does not climb past 3.0 V within an hour or gets warm should
 be replaced.
+
+### Recording to disk
+
+The app writes a session to its folder while it records (`CaptureSpool`):
+audio and accel samples are appended to `audio.wav` / `imu_accel.wav`, whose
+headers are updated at every flush (every 2 s), and the anchors, timestamps
+and gyro rows to their CSVs. Memory stays flat however long the session is;
+only the small per-second streams (anchors, timestamps, gyro: ~20 MB per
+hour in high-rate mode) are also kept for the clock fits at Stop. Disk use is
+~300 MB per hour in high-rate mode with audio. A folder that still holds an
+`INCOMPLETE` file was interrupted (app killed or crashed): its WAVs and CSVs
+are valid up to the last flush, but it has no `session.json` or aligned
+files.
 
 ### Robustness
 

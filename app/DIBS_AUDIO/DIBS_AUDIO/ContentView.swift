@@ -49,6 +49,7 @@ struct ContentView: View {
             .toolbar { EditButton() }
         }
         .onAppear {
+            ble.sessionsDirectory = store.directory
             ble.onRecordingFinished = { capture in
                 do {
                     try store.save(capture)
@@ -151,7 +152,14 @@ private struct RecordControl: View {
     @Environment(DIBSBLEManager.self) private var ble
 
     var body: some View {
+        @Bindable var ble = ble
         VStack(spacing: 12) {
+            Picker("IMU", selection: $ble.imuMode) {
+                ForEach(IMUMode.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(ble.isRecording)
+
             Button {
                 ble.isRecording ? ble.stopRecording() : ble.startRecording()
             } label: {
@@ -176,7 +184,7 @@ private struct RecordControl: View {
                             ProgressView(value: min(Double(capture.level) * 8, 1))
                         }
                         HStack {
-                            Text(String(format: "IMU %.0f Hz", Double(capture.imuSampleCount) / max(elapsed, 1)))
+                            Text(String(format: "accel %.0f Hz", capture.imuRateHz))
                             Spacer()
                             let lost = capture.lostPackets + capture.imuLostPackets
                             Text("lost: audio \(capture.lostPackets), IMU \(capture.imuLostPackets)")

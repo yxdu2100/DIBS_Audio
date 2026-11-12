@@ -36,6 +36,11 @@ struct SessionDetailView: View {
                     LabeledContent("Audio", value: String(format: "%.3f Hz, %d samples",
                                                           m.audio.sampleRateHz, m.audio.samples))
                     LabeledContent("IMU", value: "\(m.imu.samples) samples, ±\(m.imu.accelRangeG) g, ±\(m.imu.gyroRangeDPS) dps")
+                    if m.imu.mode?.isHighRate == true {
+                        LabeledContent("IMU mode", value: String(
+                            format: "accel %.1f Hz, gyro %d Hz", m.imu.accelSampleRateHz ?? Double(m.imu.odrHz),
+                            m.imu.gyroODRHz ?? 0))
+                    }
                     LabeledContent("Board", value: "\(m.boardName ?? m.boardID) · fw \(m.firmwareVersion)")
                     LabeledContent("Ended by", value: m.endReason)
                 }

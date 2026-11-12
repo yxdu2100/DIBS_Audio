@@ -23,20 +23,41 @@ final class DIBSBLEManager: NSObject {
     struct Capture {
         var startedAt = Date()
         var boardName: String?
-        var samples: [Int16] = []
+        /// The session folder, written while recording.
+        var spool: CaptureSpool
+        /// Samples written to audio.wav (lost packets as silence).
+        var audioSampleCount = 0
         var receivedPackets = 0
         var lostPackets = 0
         var nextSeq: UInt16 = 0
         var lastPacketSamples = 0
         var level: Float = 0
-        /// Last sample of each 20 ms buffer (index in samples) and the
+        /// Last sample of each 20 ms buffer (index in audio.wav) and the
         /// session time the board's microphone finished it.
         var audioAnchors: [SessionAligner.AudioAnchor] = []
 
+        var imuMode: IMUMode = .standard
+        /// Standard mode packets.
         var imuPackets: [IMUPacket] = []
+        /// Accelerometer samples received (both modes).
         var imuSampleCount = 0
         var imuLostPackets = 0
         var imuNextSeq: UInt16 = 0
+        var imuReceivedPackets = 0
+        /// Accel samples received per second over the last ~1 s (live display).
+        var imuRateHz: Double = 0
+        var imuRateMark: (time: Date, count: Int)?
+
+        /// High-rate mode: accel samples written to imu_accel.wav, placed by
+        /// their session accel index (samples of lost packets are zeros).
+        var hrAccelCount = 0
+        /// Accel samples zero-filled for lost packets.
+        var hrMissingAccel = 0
+        var hrGyro: [(accelIndex: Int64, x: Int16, y: Int16, z: Int16)] = []
+        var hrTimestamps: [(accelIndex: Int64, ticks: UInt32)] = []
+        var hrAnchors: [(seq: UInt16, ticks: UInt32, micros: UInt32)] = []
+        /// Accel index of the first sample after each FIFO overrun.
+        var hrOverruns: [Int64] = []
 
         /// Latest status from the board; the final one carries the counters.
         var status: DIBSStatus?
@@ -51,6 +72,13 @@ final class DIBSBLEManager: NSObject {
     private(set) var capture: Capture?
     private(set) var battery: DIBSBattery?
     private(set) var lastError: String?
+    /// IMU mode for the next session, remembered across launches.
+    var imuMode: IMUMode = .standard {
+        didSet { UserDefaults.standard.set(Int(imuMode.rawValue), forKey: DefaultsKey.imuMode) }
+    }
+
+    /// Where session folders are created (RecordingStore's directory).
+    var sessionsDirectory = RecordingStore.defaultDirectory
 
     /// Called with the finished capture once the board confirms it stopped.
     var onRecordingFinished: ((Capture) -> Void)?
@@ -58,6 +86,7 @@ final class DIBSBLEManager: NSObject {
     private enum DefaultsKey {
         static let boardID = "DIBS.selectedBoardID"
         static let boardName = "DIBS.selectedBoardName"
+        static let imuMode = "DIBS.imuMode"
     }
 
     private var central: CBCentralManager!
@@ -72,6 +101,7 @@ final class DIBSBLEManager: NSObject {
         let defaults = UserDefaults.standard
         selectedBoardID = defaults.string(forKey: DefaultsKey.boardID).flatMap(UUID.init)
         selectedBoardName = defaults.string(forKey: DefaultsKey.boardName)
+        imuMode = IMUMode(rawValue: UInt8(defaults.integer(forKey: DefaultsKey.imuMode))) ?? .standard
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
@@ -131,10 +161,20 @@ final class DIBSBLEManager: NSObject {
             lastError = "Battery low. Charge the board before recording."
             return
         }
-        capture = Capture(boardName: selectedBoardName)
+        let startedAt = Date()
+        let folder = sessionsDirectory.appendingPathComponent(RecordingStore.folderName(for: startedAt))
+        let spool: CaptureSpool
+        do {
+            spool = try CaptureSpool(folder: folder, mode: imuMode)
+        } catch {
+            lastError = "Could not create the session folder: \(error.localizedDescription)"
+            return
+        }
+        capture = Capture(startedAt: startedAt, boardName: selectedBoardName, spool: spool,
+                          imuMode: imuMode)
         isRecording = true
         lastError = nil
-        send(DIBSProtocol.commandStart)
+        send([DIBSProtocol.commandStart, imuMode.rawValue])
     }
 
     func stopRecording() {
@@ -159,8 +199,19 @@ final class DIBSBLEManager: NSObject {
     }
 
     private func send(_ command: UInt8) {
+        send([command])
+    }
+
+    private func send(_ bytes: [UInt8]) {
         guard let peripheral, let control else { return }
-        peripheral.writeValue(Data([command]), for: control, type: .withResponse)
+        peripheral.writeValue(Data(bytes), for: control, type: .withResponse)
+    }
+
+    /// Changes the capture in place: copying it out and back would copy its
+    /// sample arrays on every packet.
+    private func updateCapture(_ body: (inout Capture) -> Void) {
+        guard capture != nil else { return }
+        body(&capture!)
     }
 
     private func finishRecording() {
@@ -168,10 +219,21 @@ final class DIBSBLEManager: NSObject {
         stopTimeout = nil
         guard isRecording else { return }
         isRecording = false
-        if let capture, !capture.samples.isEmpty {
-            onRecordingFinished?(capture)
+        if let capture {
+            if capture.receivedPackets + capture.imuReceivedPackets > 0 {
+                onRecordingFinished?(capture)
+            } else {
+                capture.spool.discard()
+            }
         }
         capture = nil
+    }
+
+    /// Ends a session that never got data, without saving it.
+    private func abandonCapture() {
+        capture?.spool.discard()
+        capture = nil
+        isRecording = false
     }
 
     /// Asks iOS to connect to the selected board. A pending connect needs no
@@ -208,40 +270,115 @@ final class DIBSBLEManager: NSObject {
     }
 
     private func handleAudio(_ data: Data) {
-        guard isRecording, var c = capture, let packet = AudioPacket(data) else { return }
+        guard isRecording, let packet = AudioPacket(data) else { return }
+        updateCapture { c in
+            // Fill lost packets with silence so the timing stays right.
+            let gap = Int(packet.seq &- c.nextSeq)
+            if c.receivedPackets > 0, gap > 0, gap < 1000 {
+                c.lostPackets += gap
+                c.spool.audio?.appendZeros(frames: gap * c.lastPacketSamples)
+                c.audioSampleCount += gap * c.lastPacketSamples
+            }
+            c.nextSeq = packet.seq &+ 1
+            c.receivedPackets += 1
+            c.lastPacketSamples = packet.sampleCount
 
-        // Fill lost packets with silence so the timing stays right.
-        let gap = Int(packet.seq &- c.nextSeq)
-        if c.receivedPackets > 0, gap > 0, gap < 1000 {
-            c.lostPackets += gap
-            c.samples.append(contentsOf: repeatElement(0, count: gap * c.lastPacketSamples))
+            var block: [Int16] = []
+            ADPCMDecoder.decode(packet, into: &block)
+            c.spool.audio?.append(block)
+            c.audioSampleCount += block.count
+            if packet.endMicros != 0 {
+                let anchor = (wavIndex: c.audioSampleCount - 1, micros: packet.endMicros)
+                c.audioAnchors.append(anchor)
+                c.spool.text("audio_anchors.csv", header: "wav_index,session_us\n")
+                    .append("\(anchor.wavIndex),\(anchor.micros)\n")
+            }
+            var sumSquares: Float = 0
+            for v in block { sumSquares += Float(v) * Float(v) }
+            c.level = (sumSquares / Float(max(block.count, 1))).squareRoot() / 32768
+            c.spool.flushIfDue()
         }
-        c.nextSeq = packet.seq &+ 1
-        c.receivedPackets += 1
-        c.lastPacketSamples = packet.sampleCount
-
-        let start = c.samples.count
-        ADPCMDecoder.decode(packet, into: &c.samples)
-        if packet.endMicros != 0 {
-            c.audioAnchors.append((c.samples.count - 1, packet.endMicros))
-        }
-        let block = c.samples[start...]
-        let sumSquares = block.reduce(Float(0)) { $0 + Float($1) * Float($1) }
-        c.level = (sumSquares / Float(max(block.count, 1))).squareRoot() / 32768
-        capture = c
     }
 
     private func handleIMU(_ data: Data) {
-        guard isRecording, var c = capture, let packet = IMUPacket(data) else { return }
+        guard isRecording else { return }
+        if IMUHighRatePacket.isHighRate(data) {
+            guard let packet = IMUHighRatePacket(data) else { return }
+            updateCapture { c in
+                countIMUPacket(seq: packet.seq, in: &c)
+                // Place the samples by their index: zeros for lost packets.
+                let have = c.hrAccelCount
+                let start = Int(packet.accelIndex)
+                if start > have {
+                    c.hrMissingAccel += start - have
+                    c.spool.accel?.appendZeros(frames: start - have)
+                    c.hrAccelCount = start
+                }
+                let skip = max(have - start, 0) * 3
+                if skip < packet.accel.count {
+                    c.spool.accel?.append(packet.accel[skip...])
+                    c.hrAccelCount += (packet.accel.count - skip) / 3
+                }
+                c.imuSampleCount += packet.accel.count / 3
+                c.hrGyro.append(contentsOf: packet.gyro)
+                c.hrTimestamps.append(contentsOf: packet.timestamps)
+                let spool = c.spool
+                if !packet.gyro.isEmpty {
+                    let f = spool.text("imu_gyro_raw.csv", header: "accel_index,gx,gy,gz\n")
+                    for g in packet.gyro { f.append("\(g.accelIndex),\(g.x),\(g.y),\(g.z)\n") }
+                }
+                if !packet.timestamps.isEmpty {
+                    let f = spool.text("imu_accel_timestamps.csv", header: "accel_index,imu_ticks\n")
+                    for t in packet.timestamps { f.append("\(t.accelIndex),\(t.ticks)\n") }
+                }
+                if packet.hasAnchor {
+                    c.hrAnchors.append((packet.seq, packet.anchorTicks, packet.anchorMicros))
+                    spool.text("imu_anchors.csv", header: RecordingStore.imuAnchorsHeader)
+                        .append("\(packet.seq),\(packet.anchorTicks),\(packet.anchorMicros)\n")
+                }
+                if packet.overrunBefore {
+                    c.hrOverruns.append(Int64(packet.accelIndex))
+                    spool.text("imu_fifo_overruns.csv", header: "first_accel_index_after\n")
+                        .append("\(packet.accelIndex)\n")
+                }
+                spool.flushIfDue()
+            }
+        } else {
+            guard let packet = IMUPacket(data) else { return }
+            updateCapture { c in
+                countIMUPacket(seq: packet.seq, in: &c)
+                c.imuSampleCount += packet.samples.count
+                c.imuPackets.append(packet)
+                c.spool.text("imu_raw.csv", header: RecordingStore.rawCSVHeader)
+                    .append(RecordingStore.rawCSVRows(packet))
+                if packet.hasAnchor {
+                    c.spool.text("imu_anchors.csv", header: RecordingStore.imuAnchorsHeader)
+                        .append("\(packet.seq),\(packet.anchorTicks),\(packet.anchorMicros)\n")
+                }
+                c.spool.flushIfDue()
+            }
+        }
+    }
 
-        let gap = Int(packet.seq &- c.imuNextSeq)
-        if !c.imuPackets.isEmpty, gap > 0, gap < 1000 {
+    private func countIMUPacket(seq: UInt16, in c: inout Capture) {
+        let gap = Int(seq &- c.imuNextSeq)
+        if c.imuReceivedPackets > 0, gap > 0, gap < 1000 {
             c.imuLostPackets += gap
         }
-        c.imuNextSeq = packet.seq &+ 1
-        c.imuSampleCount += packet.samples.count
-        c.imuPackets.append(packet)
-        capture = c
+        c.imuNextSeq = seq &+ 1
+        c.imuReceivedPackets += 1
+        // A rate over the recent past: the average since Start would creep up
+        // for the seconds the board waits for the link and lets the IMU settle.
+        let now = Date()
+        if let mark = c.imuRateMark {
+            let dt = now.timeIntervalSince(mark.time)
+            if dt >= 1 {
+                c.imuRateHz = Double(c.imuSampleCount - mark.count) / dt
+                c.imuRateMark = (now, c.imuSampleCount)
+            }
+        } else {
+            c.imuRateMark = (now, c.imuSampleCount)
+        }
     }
 
     private func handleStatus(_ data: Data) {
@@ -254,10 +391,9 @@ final class DIBSBLEManager: NSObject {
         if isRecording { capture?.status = status }
         if status.state == .idle, status.endReason == .lowBattery, isRecording {
             lastError = "Recording stopped: battery low. Charge the board."
-            if (capture?.receivedPackets ?? 0) == 0 {
+            if (capture?.receivedPackets ?? 0) + (capture?.imuReceivedPackets ?? 0) == 0 {
                 // Refused before any data: nothing to save.
-                isRecording = false
-                capture = nil
+                abandonCapture()
                 return
             }
             finishRecording()
@@ -265,7 +401,7 @@ final class DIBSBLEManager: NSObject {
         }
         // Idle while we record: the board stopped (on request or on its own).
         if status.state == .idle, isRecording,
-           stopTimeout != nil || (capture?.receivedPackets ?? 0) > 0 {
+           stopTimeout != nil || (capture?.receivedPackets ?? 0) + (capture?.imuReceivedPackets ?? 0) > 0 {
             finishRecording()
         }
     }
@@ -376,7 +512,7 @@ extension DIBSBLEManager: CBPeripheralDelegate {
                     error: Error?) {
         if let error {
             lastError = error.localizedDescription
-            if isRecording, stopTimeout == nil { isRecording = false; capture = nil }
+            if isRecording, stopTimeout == nil { abandonCapture() }
         }
     }
 }

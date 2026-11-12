@@ -33,7 +33,6 @@ enum ADPCMDecoder {
             return Int16(predictor)
         }
 
-        out.reserveCapacity(out.count + packet.sampleCount)
         for byte in packet.payload {
             out.append(step(byte & 0x0F))
             out.append(step(byte >> 4))

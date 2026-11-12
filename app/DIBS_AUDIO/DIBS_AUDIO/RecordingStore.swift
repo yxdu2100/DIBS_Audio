@@ -3,11 +3,25 @@ import Foundation
 
 /// One saved session: a folder holding
 ///   audio.wav          16-bit mono, lost packets filled with silence
-///   imu_raw.csv        raw IMU samples with their IMU timestamps
+///   imu_raw.csv        raw IMU samples with their IMU timestamps (standard mode)
 ///   imu_anchors.csv    IMU tick <-> session clock pairs from the board
 ///   audio_anchors.csv  audio.wav sample index <-> session clock pairs
-///   imu_aligned.csv    IMU samples in SI units on the audio timeline
+///   imu_aligned.csv    IMU samples in SI units on the audio timeline (in
+///                      high-rate mode one row per gyroscope sample, with the
+///                      accel sample of the same FIFO slot)
 ///   session.json       board, settings, loss counters and both clock fits
+/// and in high-rate mode also
+///   imu_accel.wav      every accel sample, 3 channels (x, y, z) of raw
+///                      16-bit LSB, at the measured rate; lost packets zeros
+///   imu_accel_timestamps.csv  FIFO timestamps: accel index, IMU ticks
+///   imu_accel_timeline.csv    accel index -> session/audio time, piecewise
+///                      linear (np.interp over it gives every sample's time)
+///   imu_gyro_raw.csv   raw gyroscope samples with their accel index
+///   imu_fifo_overruns.csv  first accel index after each FIFO overrun (if any)
+///
+/// The raw files are written while recording (CaptureSpool); a folder that
+/// still holds an INCOMPLETE file was interrupted (app killed or crashed) and
+/// has the raw files up to the last flush but no session.json.
 struct Recording: Identifiable, Hashable {
     let folder: URL
     let metadata: SessionMetadata?
@@ -24,7 +38,8 @@ struct Recording: Identifiable, Hashable {
         return m.audio.lostPackets + m.audio.droppedOnBoard > 0
             || m.imu.lostPackets + m.imu.droppedOnBoard + m.imu.overruns > 0
             || m.imu.i2cErrors > 0
-            || m.imuClockFit == nil || m.audioClockFit == nil
+            || m.imuClockFit == nil
+            || (m.imu.mode?.hasAudio ?? true) && m.audioClockFit == nil
             || (m.imuClockFit?.residualRMSMicros ?? 0) > 200
             || (m.audioClockFit?.residualRMSMicros ?? 0) > 200
     }
@@ -69,21 +84,35 @@ struct SessionMetadata: Codable {
     }
 
     struct IMU: Codable {
+        /// "standard" or "highRate" (absent before format 2: standard).
+        var mode: IMUMode?
+        /// Accelerometer ODR, nominal.
         var odrHz: Int
         var accelRangeG: Int
         var gyroRangeDPS: Int
         var accelMicroGPerLSB: Int
         var gyroMilliDPSPerLSB: Int
         var freqFine: Int
+        /// Accelerometer samples received.
         var samples: Int
         var packets: Int
         var lostPackets: Int
         var droppedOnBoard: Int
         var overruns: Int
         var i2cErrors: Int
+        var gyroODRHz: Int?
+        var accelPerTimestamp: Int?
+        /// High-rate: measured accel rate, and the rate written in imu_accel.wav.
+        var accelSampleRateHz: Double?
+        var accelWavSampleRateHz: Int?
+        /// High-rate: accel samples zero-filled for lost packets.
+        var missingAccelSamples: Int?
+        /// High-rate: accel index -> IMU ticks (slope = ticks per sample).
+        var accelTimestampFit: SessionAligner.Fit?
+        var accelTimestampsRejected: Int?
     }
 
-    var formatVersion = 1
+    var formatVersion = 2
     var startedAt: Date
     var endedAt: Date
     var boardID: String
@@ -111,9 +140,20 @@ final class RecordingStore {
 
     let directory: URL
 
+    static var defaultDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Sessions", isDirectory: true)
+    }
+
+    /// "DIBS yyyy-MM-dd HH.mm.ss" from the session start.
+    static func folderName(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        return "DIBS \(formatter.string(from: date))"
+    }
+
     init(directory: URL? = nil) {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        self.directory = directory ?? docs.appendingPathComponent("Sessions", isDirectory: true)
+        self.directory = directory ?? Self.defaultDirectory
         try? FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
         reload()
     }
@@ -138,38 +178,76 @@ final class RecordingStore {
 
     @discardableResult
     func save(_ capture: DIBSBLEManager.Capture) throws -> Recording {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-        let folder = directory.appendingPathComponent("DIBS \(formatter.string(from: capture.startedAt))")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // The raw streams are already on disk; this finishes the WAV headers
+        // and adds the fits and the aligned files.
+        let spool = capture.spool
+        let folder = spool.folder
+        spool.closeTexts()
 
         let status = capture.status
         var audioFit: SessionAligner.Fit?
         var imuFit: SessionAligner.Fit?
         var rate = status?.nominalSampleRate ?? 16000
+        var hr: HighRateResult?
         if let status {
-            let aligner = SessionAligner(status: status, audioAnchors: capture.audioAnchors,
-                                         packets: capture.imuPackets)
+            let aligner = capture.imuMode.isHighRate
+                ? SessionAligner(status: status, audioAnchors: capture.audioAnchors,
+                                 imuAnchors: capture.hrAnchors.map { ($0.ticks, $0.micros) })
+                : SessionAligner(status: status, audioAnchors: capture.audioAnchors,
+                                 packets: capture.imuPackets)
             audioFit = aligner.audioFit()
             imuFit = aligner.imuFit()
             rate = aligner.sampleRate(audioFit)
-            try Self.rawCSV(capture.imuPackets).write(
-                to: folder.appendingPathComponent("imu_raw.csv"), atomically: true, encoding: .utf8)
-            try Self.imuAnchorsCSV(capture.imuPackets).write(
-                to: folder.appendingPathComponent("imu_anchors.csv"), atomically: true, encoding: .utf8)
-            try Self.audioAnchorsCSV(capture.audioAnchors).write(
-                to: folder.appendingPathComponent("audio_anchors.csv"), atomically: true,
-                encoding: .utf8)
-            if let imuFit {
-                try Self.alignedCSV(aligner.alignedSamples(imu: imuFit, audio: audioFit),
-                                    status: status).write(
-                    to: folder.appendingPathComponent("imu_aligned.csv"), atomically: true,
-                    encoding: .utf8)
+            if capture.imuMode.isHighRate {
+                hr = try Self.saveHighRate(capture, status: status, aligner: aligner,
+                                           imuFit: imuFit, audioFit: audioFit, folder: folder)
+            } else if let imuFit {
+                try Self.writeAlignedCSV(aligner.alignedSamples(imu: imuFit, audio: audioFit),
+                                         status: status,
+                                         to: folder.appendingPathComponent("imu_aligned.csv"))
             }
         }
-        try WAVWriter.data(samples: capture.samples, sampleRate: Int(rate.rounded()))
-            .write(to: folder.appendingPathComponent("audio.wav"))
+        spool.audio?.finish(sampleRate: Int(rate.rounded()))
+        spool.accel?.finish(sampleRate: hr?.wavRate ?? status?.imuODRHz ?? 3840)
+        // Without audio the session lasts as long as the accel stream.
+        let duration = capture.imuMode.hasAudio
+            ? Double(capture.audioSampleCount) / rate
+            : Double(capture.hrAccelCount) / (hr?.accelRate ?? Double(status?.imuODRHz ?? 3840))
 
+        let audioMeta = SessionMetadata.Audio(
+            sampleRateHz: rate,
+            nominalSampleRateHz: status?.nominalSampleRate ?? 0,
+            wavSampleRateHz: Int(rate.rounded()),
+            t0SessionMicros: status?.audioT0us ?? 0,
+            skipSamples: status?.audioSkipSamples ?? 0,
+            samples: capture.audioSampleCount, receivedPackets: capture.receivedPackets,
+            lostPackets: capture.lostPackets,
+            droppedOnBoard: status?.audioDroppedPackets ?? 0,
+            durationSeconds: duration)
+        let accelUgLSB: Int = status?.accelMicroGPerLSB ?? 0
+        let gyroMdpsLSB: Int = status?.gyroMilliDPSPerLSB ?? 0
+        var imuMeta = SessionMetadata.IMU(
+            mode: capture.imuMode,
+            odrHz: status?.imuODRHz ?? 0,
+            accelRangeG: Int((Double(accelUgLSB) * 32768 / 1e6).rounded()),
+            gyroRangeDPS: Self.gyroRange[gyroMdpsLSB] ?? 0,
+            accelMicroGPerLSB: accelUgLSB,
+            gyroMilliDPSPerLSB: gyroMdpsLSB,
+            freqFine: Int(status?.imuFreqFine ?? 0),
+            samples: capture.imuSampleCount, packets: capture.imuReceivedPackets,
+            lostPackets: capture.imuLostPackets,
+            droppedOnBoard: status?.imuDroppedPackets ?? 0,
+            overruns: status?.imuOverruns ?? 0,
+            i2cErrors: status?.imuI2CErrors ?? 0)
+        imuMeta.gyroODRHz = status?.gyroODRHz
+        imuMeta.accelPerTimestamp = status?.imuAccelPerTimestamp
+        if let hr {
+            imuMeta.accelSampleRateHz = hr.accelRate
+            imuMeta.accelWavSampleRateHz = hr.wavRate
+            imuMeta.missingAccelSamples = capture.hrMissingAccel
+            imuMeta.accelTimestampFit = hr.timeline.fit
+            imuMeta.accelTimestampsRejected = hr.timeline.rejected
+        }
         let metadata = SessionMetadata(
             startedAt: capture.startedAt,
             endedAt: Date(),
@@ -179,32 +257,15 @@ final class RecordingStore {
             resetReason: status.map { String(format: "0x%08X", $0.resetReason) } ?? "unknown",
             sessionID: status.map { String(format: "%08X", $0.sessionID) } ?? "unknown",
             endReason: status.map { "\($0.endReason)" } ?? "unknown",
-            audio: .init(sampleRateHz: rate,
-                         nominalSampleRateHz: status?.nominalSampleRate ?? 0,
-                         wavSampleRateHz: Int(rate.rounded()),
-                         t0SessionMicros: status?.audioT0us ?? 0,
-                         skipSamples: status?.audioSkipSamples ?? 0,
-                         samples: capture.samples.count, receivedPackets: capture.receivedPackets,
-                         lostPackets: capture.lostPackets,
-                         droppedOnBoard: status?.audioDroppedPackets ?? 0,
-                         durationSeconds: Double(capture.samples.count) / rate),
-            imu: .init(odrHz: status?.imuODRHz ?? 0,
-                       accelRangeG: Int((Double(status?.accelMicroGPerLSB ?? 0) * 32768 / 1e6).rounded()),
-                       gyroRangeDPS: Self.gyroRange[status?.gyroMilliDPSPerLSB ?? 0] ?? 0,
-                       accelMicroGPerLSB: status?.accelMicroGPerLSB ?? 0,
-                       gyroMilliDPSPerLSB: status?.gyroMilliDPSPerLSB ?? 0,
-                       freqFine: Int(status?.imuFreqFine ?? 0),
-                       samples: capture.imuSampleCount, packets: capture.imuPackets.count,
-                       lostPackets: capture.imuLostPackets,
-                       droppedOnBoard: status?.imuDroppedPackets ?? 0,
-                       overruns: status?.imuOverruns ?? 0,
-                       i2cErrors: status?.imuI2CErrors ?? 0),
+            audio: audioMeta,
+            imu: imuMeta,
             audioClockFit: audioFit,
             imuClockFit: imuFit)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(metadata).write(to: folder.appendingPathComponent("session.json"))
+        spool.markComplete()
 
         reload()
         return recordings.first { $0.folder == folder }
@@ -219,68 +280,125 @@ final class RecordingStore {
         reload()
     }
 
-    private static func rawCSV(_ packets: [IMUPacket]) -> String {
-        var s = "packet_seq,sample,overrun_before,imu_ticks,ax,ay,az,gx,gy,gz\n"
-        for p in packets {
-            for (k, x) in p.samples.enumerated() {
-                s += "\(p.seq),\(k),\(p.overrunBefore && k == 0 ? 1 : 0),\(x.ticks),"
-                s += "\(x.accel.0),\(x.accel.1),\(x.accel.2),\(x.gyro.0),\(x.gyro.1),\(x.gyro.2)\n"
+    struct HighRateResult {
+        var timeline: AccelTimeline
+        var accelRate: Double?
+        var wavRate: Int
+    }
+
+    private static func saveHighRate(_ c: DIBSBLEManager.Capture, status: DIBSStatus,
+                                     aligner: SessionAligner, imuFit: SessionAligner.Fit?,
+                                     audioFit: SessionAligner.Fit?, folder: URL) throws -> HighRateResult {
+        let count = Int64(c.hrAccelCount)
+        let timeline = AccelTimeline(timestamps: c.hrTimestamps, overruns: c.hrOverruns, count: count)
+        var accelRate: Double?
+        if let tps = timeline.ticksPerSample, let imuFit {
+            accelRate = 1e6 / (tps * imuFit.slopeMicrosPerCount)
+        }
+        let wavRate = Int((accelRate ?? Double(status.imuODRHz)).rounded())
+        // imu_accel.wav, the timestamps, anchors and gyro were written while
+        // recording.
+        c.spool.accel?.finish(sampleRate: wavRate)
+
+        if let imuFit {
+            let clock = aligner.tickClock(imuFit)
+            let tl = try TextStream(url: folder.appendingPathComponent("imu_accel_timeline.csv"),
+                                    header: "accel_index,measured,imu_ticks,session_us,time_s,audio_index\n")
+            for p in timeline.points {
+                let us = clock.micros(at: p.ticks)
+                let t = aligner.audioTime(micros: us, audio: audioFit)
+                tl.append(String(format: "%lld,%d,%.2f,%.2f,%.7f,%.2f\n", p.accelIndex,
+                                 p.measured ? 1 : 0, p.ticks, us, t.time, t.index))
             }
+            tl.close()
+
+            // Gyro-rate summary in the standard columns (chart, tap_check),
+            // with the accel sample at each gyro sample's index (mapped from
+            // imu_accel.wav, not held in memory).
+            let g = 9.80665
+            let accel = Double(status.accelMicroGPerLSB) * 1e-6 * g
+            let gyro = Double(status.gyroMilliDPSPerLSB) * 1e-3 * .pi / 180
+            let wav = try Data(contentsOf: folder.appendingPathComponent("imu_accel.wav"),
+                               options: .alwaysMapped)
+            let frames = Int64(max(wav.count - 44, 0) / 6)
+            let out = try TextStream(url: folder.appendingPathComponent("imu_aligned.csv"),
+                                     header: "time_s,audio_index,ax_mps2,ay_mps2,az_mps2,gx_rads,gy_rads,gz_rads,accel_index\n")
+            wav.withUnsafeBytes { raw in
+                func a(_ i: Int) -> Double {
+                    Double(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: 44 + i * 2,
+                                                                  as: Int16.self))) * accel
+                }
+                for x in c.hrGyro {
+                    guard x.accelIndex >= 0, x.accelIndex < min(count, frames),
+                          let ticks = timeline.ticks(at: x.accelIndex) else { continue }
+                    let t = aligner.audioTime(micros: clock.micros(at: ticks), audio: audioFit)
+                    let i = Int(x.accelIndex) * 3
+                    out.append(String(format: "%.6f,%.1f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%lld\n",
+                                      t.time, t.index, a(i), a(i + 1), a(i + 2), Double(x.x) * gyro,
+                                      Double(x.y) * gyro, Double(x.z) * gyro, x.accelIndex))
+                }
+            }
+            out.close()
+        }
+        return HighRateResult(timeline: timeline, accelRate: accelRate, wavRate: wavRate)
+    }
+
+    static let rawCSVHeader = "packet_seq,sample,overrun_before,imu_ticks,ax,ay,az,gx,gy,gz\n"
+    static let imuAnchorsHeader = "packet_seq,imu_ticks,session_us\n"
+
+    /// imu_raw.csv rows of one standard-mode packet.
+    static func rawCSVRows(_ p: IMUPacket) -> String {
+        var s = ""
+        for (k, x) in p.samples.enumerated() {
+            s += "\(p.seq),\(k),\(p.overrunBefore && k == 0 ? 1 : 0),\(x.ticks),"
+            s += "\(x.accel.0),\(x.accel.1),\(x.accel.2),\(x.gyro.0),\(x.gyro.1),\(x.gyro.2)\n"
         }
         return s
     }
 
-    private static func imuAnchorsCSV(_ packets: [IMUPacket]) -> String {
-        var s = "packet_seq,imu_ticks,session_us\n"
-        for p in packets where p.hasAnchor {
-            s += "\(p.seq),\(p.anchorTicks),\(p.anchorMicros)\n"
-        }
-        return s
-    }
-
-    private static func audioAnchorsCSV(_ anchors: [SessionAligner.AudioAnchor]) -> String {
-        var s = "wav_index,session_us\n"
-        for a in anchors {
-            s += "\(a.wavIndex),\(a.micros)\n"
-        }
-        return s
-    }
-
-    private static func alignedCSV(_ samples: [SessionAligner.AlignedSample], status: DIBSStatus) -> String {
+    private static func writeAlignedCSV(_ samples: [SessionAligner.AlignedSample], status: DIBSStatus,
+                                        to url: URL) throws {
         let g = 9.80665
         let accel = Double(status.accelMicroGPerLSB) * 1e-6 * g
         let gyro = Double(status.gyroMilliDPSPerLSB) * 1e-3 * .pi / 180
-        var s = "time_s,audio_index,ax_mps2,ay_mps2,az_mps2,gx_rads,gy_rads,gz_rads\n"
+        let out = try TextStream(url: url,
+                                 header: "time_s,audio_index,ax_mps2,ay_mps2,az_mps2,gx_rads,gy_rads,gz_rads\n")
         for x in samples {
-            s += String(format: "%.6f,%.1f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f\n", x.time, x.audioIndex,
-                        Double(x.accel.0) * accel, Double(x.accel.1) * accel, Double(x.accel.2) * accel,
-                        Double(x.gyro.0) * gyro, Double(x.gyro.1) * gyro, Double(x.gyro.2) * gyro)
+            out.append(String(format: "%.6f,%.1f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f\n", x.time, x.audioIndex,
+                              Double(x.accel.0) * accel, Double(x.accel.1) * accel, Double(x.accel.2) * accel,
+                              Double(x.gyro.0) * gyro, Double(x.gyro.1) * gyro, Double(x.gyro.2) * gyro))
         }
-        return s
+        out.close()
     }
 }
 
 enum WAVWriter {
-    /// 16-bit mono PCM WAV.
-    static func data(samples: [Int16], sampleRate: Int) -> Data {
-        let dataSize = UInt32(samples.count * 2)
+    /// 16-bit PCM WAV; `samples` interleaved when `channels` > 1.
+    static func data(samples: [Int16], sampleRate: Int, channels: Int = 1) -> Data {
+        var d = header(dataBytes: samples.count * 2, sampleRate: sampleRate, channels: channels)
+        d.reserveCapacity(d.count + samples.count * 2)
+        // Int16 is little-endian on every Apple platform.
+        samples.withUnsafeBytes { d.append(contentsOf: $0) }
+        return d
+    }
+
+    /// The 44-byte header of a 16-bit PCM WAV with `dataBytes` of samples.
+    static func header(dataBytes: Int, sampleRate: Int, channels: Int) -> Data {
+        let dataSize = UInt32(clamping: dataBytes)
         var d = Data()
         func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
         func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
 
-        d.append(contentsOf: Array("RIFF".utf8)); u32(36 + dataSize)
+        d.append(contentsOf: Array("RIFF".utf8)); u32(36 &+ dataSize)
         d.append(contentsOf: Array("WAVE".utf8))
         d.append(contentsOf: Array("fmt ".utf8)); u32(16)
         u16(1)                              // PCM
-        u16(1)                              // mono
+        u16(UInt16(channels))
         u32(UInt32(sampleRate))
-        u32(UInt32(sampleRate * 2))         // byte rate
-        u16(2)                              // block align
+        u32(UInt32(sampleRate * 2 * channels))  // byte rate
+        u16(UInt16(2 * channels))               // block align
         u16(16)                             // bits per sample
         d.append(contentsOf: Array("data".utf8)); u32(dataSize)
-        samples.withUnsafeBufferPointer { buf in
-            for s in buf { withUnsafeBytes(of: s.littleEndian) { d.append(contentsOf: $0) } }
-        }
         return d
     }
 }

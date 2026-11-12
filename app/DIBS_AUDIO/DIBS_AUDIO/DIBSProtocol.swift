@@ -1,8 +1,8 @@
 import CoreBluetooth
 
-/// BLE protocol v3, shared with firmware/src/protocol.h.
+/// BLE protocol v4, shared with firmware/src/protocol.h.
 enum DIBSProtocol {
-    static let version: UInt8 = 3
+    static let version: UInt8 = 4
 
     static let serviceUUID = CBUUID(string: "D1B50001-6E2B-4C1F-9A7D-3E8B5F0C2A41")
     static let controlUUID = CBUUID(string: "D1B50002-6E2B-4C1F-9A7D-3E8B5F0C2A41")
@@ -21,6 +21,51 @@ enum DIBSProtocol {
     static let audioHeaderLength = 9
     static let imuHeaderLength = 12
     static let imuSampleLength = 16
+    static let imuHighRateHeaderLength = 18
+    static let imuFlagHighRate: UInt8 = 0x80
+}
+
+/// What the IMU records in a session (byte 2 of the start command).
+enum IMUMode: UInt8, Codable, CaseIterable, Identifiable {
+    /// Accelerometer + gyroscope at 120 Hz.
+    case standard = 0
+    /// Accelerometer at 3840 Hz + gyroscope at 240 Hz.
+    case highRate = 1
+    /// As highRate with the microphone off (no audio.wav; times are on the
+    /// board's session clock).
+    case highRateIMUOnly = 2
+
+    var isHighRate: Bool { self != .standard }
+    var hasAudio: Bool { self != .highRateIMUOnly }
+
+    var id: UInt8 { rawValue }
+
+    /// session.json stores the name ("standard", "highRate").
+    private static let names: [IMUMode: String] = [.standard: "standard", .highRate: "highRate",
+                                                     .highRateIMUOnly: "highRateIMUOnly"]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let name = try? c.decode(String.self),
+           let mode = Self.names.first(where: { $0.value == name })?.key {
+            self = mode
+        } else {
+            self = IMUMode(rawValue: try c.decode(UInt8.self)) ?? .standard
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(Self.names[self]!)
+    }
+
+    var label: String {
+        switch self {
+        case .standard: "IMU 120 Hz"
+        case .highRate: "3.84k + mic"
+        case .highRateIMUOnly: "3.84k, no mic"
+        }
+    }
 }
 
 /// Little-endian readers for notification payloads.
@@ -60,8 +105,12 @@ struct DIBSStatus: Equatable, Codable {
     var imuOverruns: Int
     var imuSamples: Int
     var imuI2CErrors: Int
+    var imuMode: IMUMode
+    var gyroODRHz: Int
+    /// Accelerometer samples per FIFO timestamp (1 in standard mode).
+    var imuAccelPerTimestamp: Int
 
-    static let length = 52
+    static let length = 56
 
     /// Nominal audio sample rate from the PDM clock register; the session's
     /// audio clock fit measures the real one.
@@ -92,6 +141,9 @@ struct DIBSStatus: Equatable, Codable {
         imuOverruns = Int(b.u16(42))
         imuSamples = Int(b.u32(44))
         imuI2CErrors = Int(b.u16(48))
+        imuMode = IMUMode(rawValue: b[50]) ?? .standard
+        gyroODRHz = Int(b.u16(52))
+        imuAccelPerTimestamp = Int(b.u16(54))
     }
 }
 
@@ -168,7 +220,8 @@ struct IMUPacket {
 
     init?(_ data: Data) {
         let b = [UInt8](data)
-        guard b.count >= DIBSProtocol.imuHeaderLength else { return nil }
+        guard b.count >= DIBSProtocol.imuHeaderLength,
+              b[3] & DIBSProtocol.imuFlagHighRate == 0 else { return nil }
         let n = Int(b[2])
         guard n > 0, b.count >= DIBSProtocol.imuHeaderLength + n * DIBSProtocol.imuSampleLength
         else { return nil }
@@ -182,6 +235,55 @@ struct IMUPacket {
             return Sample(ticks: b.u32(o),
                           accel: (b.i16(o + 4), b.i16(o + 6), b.i16(o + 8)),
                           gyro: (b.i16(o + 10), b.i16(o + 12), b.i16(o + 14)))
+        }
+    }
+}
+
+/// One high-rate IMU notification: consecutive accelerometer samples
+/// numbered from the session start, plus the gyroscope samples and FIFO
+/// timestamps that fell in the same FIFO time slots.
+struct IMUHighRatePacket {
+    var seq: UInt16
+    var hasAnchor: Bool
+    var overrunBefore: Bool
+    var anchorTicks: UInt32
+    var anchorMicros: UInt32
+    /// Index of `accel[0]` among all accelerometer samples of the session.
+    var accelIndex: UInt32
+    /// x, y, z interleaved, raw LSB.
+    var accel: [Int16]
+    /// Gyroscope samples with the index of the accel sample of their slot.
+    var gyro: [(accelIndex: Int64, x: Int16, y: Int16, z: Int16)]
+    /// FIFO timestamps (IMU ticks) with the index of their accel sample.
+    var timestamps: [(accelIndex: Int64, ticks: UInt32)]
+
+    static func isHighRate(_ data: Data) -> Bool {
+        data.count >= 4 && data[data.startIndex + 3] & DIBSProtocol.imuFlagHighRate != 0
+    }
+
+    init?(_ data: Data) {
+        let b = [UInt8](data)
+        let h = DIBSProtocol.imuHighRateHeaderLength
+        guard b.count >= h, b[3] & DIBSProtocol.imuFlagHighRate != 0 else { return nil }
+        let na = Int(b[2]), ng = Int(b[16]), nt = Int(b[17])
+        guard b.count >= h + na * 6 + ng * 8 + nt * 6 else { return nil }
+        seq = b.u16(0)
+        hasAnchor = b[3] & 0x01 != 0
+        overrunBefore = b[3] & 0x02 != 0
+        anchorTicks = b.u32(4)
+        anchorMicros = b.u32(8)
+        accelIndex = b.u32(12)
+        let base = Int64(accelIndex)
+        accel = (0..<na * 3).map { b.i16(h + $0 * 2) }
+        var o = h + na * 6
+        gyro = (0..<ng).map { k in
+            let r = o + k * 8
+            return (base + Int64(b.i16(r)), b.i16(r + 2), b.i16(r + 4), b.i16(r + 6))
+        }
+        o += ng * 8
+        timestamps = (0..<nt).map { k in
+            let r = o + k * 6
+            return (base + Int64(b.i16(r)), b.u32(r + 2))
         }
     }
 }

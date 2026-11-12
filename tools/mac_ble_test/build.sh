@@ -7,6 +7,6 @@ APP=$HERE/../../app/DIBS_AUDIO/DIBS_AUDIO
 cd $HERE
 swiftc -O -default-isolation MainActor -o dibs_mactest main.swift \
   $APP/DIBSBLEManager.swift $APP/DIBSProtocol.swift $APP/ADPCMDecoder.swift \
-  $APP/RecordingStore.swift $APP/SessionAligner.swift \
+  $APP/RecordingStore.swift $APP/SessionAligner.swift $APP/CaptureSpool.swift \
   -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 codesign -s - -f dibs_mactest
