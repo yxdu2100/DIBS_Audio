@@ -36,16 +36,18 @@ static ssize_t control_write(struct bt_conn *conn, const struct bt_gatt_attr *at
 {
 	const uint8_t *cmd = buf;
 
-	if (offset != 0 || len < 1 || len > 2) {
+	if (offset != 0 || len < 1 || len > 3) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
 	switch (cmd[0]) {
 	case DIBS_CMD_START:
-		if (len == 2 && cmd[1] > DIBS_IMU_MODE_HIGHRATE_IMU_ONLY) {
+		if ((len >= 2 && cmd[1] > DIBS_IMU_MODE_HIGHRATE_IMU_ONLY) ||
+		    (len == 3 && cmd[2] != DIBS_PHY_1M && cmd[2] != DIBS_PHY_2M)) {
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
-		session_start(len == 2 ? cmd[1] : DIBS_IMU_MODE_STANDARD);
+		session_start(len >= 2 ? cmd[1] : DIBS_IMU_MODE_STANDARD,
+			      len == 3 ? cmd[2] : DIBS_PHY_2M);
 		break;
 	case DIBS_CMD_STOP:
 		session_stop(DIBS_END_STOP);
@@ -153,6 +155,9 @@ static atomic_t adv_allowed = ATOMIC_INIT(1);
 static atomic_t link_wanted = ATOMIC_INIT(BLE_LINK_IDLE);
 /* Current connection interval, 1.25 ms units (0: not connected). */
 static atomic_t link_interval;
+/* PHY in use (TX) and the one asked for (BT_GAP_LE_PHY_1M/2M = DIBS_PHY_*). */
+static atomic_t link_phy;
+static atomic_t phy_wanted = ATOMIC_INIT(DIBS_PHY_2M);
 
 static void advertise(void)
 {
@@ -188,6 +193,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	if (bt_conn_get_info(conn, &info) == 0) {
 		atomic_set(&link_interval, info.le.interval);
+		atomic_set(&link_phy, info.le.phy ? info.le.phy->tx_phy : 0);
 	}
 
 	bt_conn_le_param_update(conn, &links[atomic_get(&link_wanted)]);
@@ -210,6 +216,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		current_conn = NULL;
 	}
 	atomic_set(&link_interval, 0);
+	atomic_set(&link_phy, 0);
 	power_set_connected(false);
 }
 
@@ -227,6 +234,7 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval,
 
 static void le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *info)
 {
+	atomic_set(&link_phy, info->tx_phy);
 	LOG_INF("PHY tx %u rx %u", info->tx_phy, info->rx_phy);
 }
 
@@ -282,7 +290,26 @@ void ble_set_advertising(bool allowed)
 bool ble_link_ready(void)
 {
 	return current_conn &&
-	       atomic_get(&link_interval) <= links[atomic_get(&link_wanted)].interval_max;
+	       atomic_get(&link_interval) <= links[atomic_get(&link_wanted)].interval_max &&
+	       atomic_get(&link_phy) == atomic_get(&phy_wanted);
+}
+
+void ble_set_phy(uint8_t phy)
+{
+	atomic_set(&phy_wanted, phy);
+	if (current_conn && atomic_get(&link_phy) != phy) {
+		int err = bt_conn_le_phy_update(current_conn, phy == DIBS_PHY_1M
+						? BT_CONN_LE_PHY_PARAM_1M : BT_CONN_LE_PHY_PARAM_2M);
+
+		if (err) {
+			LOG_WRN("PHY update: %d", err);
+		}
+	}
+}
+
+uint8_t ble_phy(void)
+{
+	return atomic_get(&link_phy);
 }
 
 void ble_set_link(enum ble_link link)

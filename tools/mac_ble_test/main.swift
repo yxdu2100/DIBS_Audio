@@ -1,7 +1,7 @@
 import Foundation
 
 // Runs the iOS app's BLE, storage and alignment code on a Mac:
-//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS_Audio-A05D | any] [std | hr | hrimu]
+//   dibs_mactest <output dir> [seconds] [board name, e.g. DIBS_Audio-A05D | any] [std | hr | hrimu] [1m | 2m]
 // Selects the named board (or the first one found), records one session,
 // saves it like the app does and prints a summary.
 let args = CommandLine.arguments
@@ -13,6 +13,7 @@ let mode: IMUMode = args.count < 5 ? .standard
 let store = RecordingStore(directory: outDir)
 let ble = DIBSBLEManager()
 ble.imuMode = mode
+ble.phy = args.count > 5 && args[5].lowercased() == "2m" ? .twoM : .oneM
 ble.sessionsDirectory = store.directory
 ble.startBrowsing()
 var started = false
@@ -50,6 +51,8 @@ ble.onRecordingFinished = { capture in
         } else {
             print("imu clock: no fit")
         }
+        let rssi = m.rssi.map { "median \($0.medianDBm) dBm, min \($0.minDBm), max \($0.maxDBm), \($0.readings) readings" } ?? "none"
+        print("radio: PHY \(m.blePHY ?? "?") (asked \(m.blePHYRequested ?? "?")), RSSI \(rssi)")
         print("saved", r.folder.path)
         exit(0)
     } catch {

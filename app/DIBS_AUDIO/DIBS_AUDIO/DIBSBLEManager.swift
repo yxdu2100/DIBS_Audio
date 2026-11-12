@@ -37,6 +37,7 @@ final class DIBSBLEManager: NSObject {
         var audioAnchors: [SessionAligner.AudioAnchor] = []
 
         var imuMode: IMUMode = .standard
+        var phy: RadioPHY = .oneM
         /// Standard mode packets.
         var imuPackets: [IMUPacket] = []
         /// Accelerometer samples received (both modes).
@@ -59,6 +60,10 @@ final class DIBSBLEManager: NSObject {
         /// Accel index of the first sample after each FIFO overrun.
         var hrOverruns: [Int64] = []
 
+        /// Signal strength at the phone (dBm), read about once a second.
+        var rssi: [Int] = []
+        var rssiRequestedAt: Date?
+
         /// Latest status from the board; the final one carries the counters.
         var status: DIBSStatus?
     }
@@ -77,6 +82,12 @@ final class DIBSBLEManager: NSObject {
         didSet { UserDefaults.standard.set(Int(imuMode.rawValue), forKey: DefaultsKey.imuMode) }
     }
 
+    /// Radio PHY for the next session, remembered across launches. 1M by
+    /// default: worn on the skin it loses no packets at RSSI where 2M does.
+    var phy: RadioPHY = .oneM {
+        didSet { UserDefaults.standard.set(Int(phy.rawValue), forKey: DefaultsKey.phy) }
+    }
+
     /// Where session folders are created (RecordingStore's directory).
     var sessionsDirectory = RecordingStore.defaultDirectory
 
@@ -87,6 +98,7 @@ final class DIBSBLEManager: NSObject {
         static let boardID = "DIBS.selectedBoardID"
         static let boardName = "DIBS.selectedBoardName"
         static let imuMode = "DIBS.imuMode"
+        static let phy = "DIBS.phy"
     }
 
     private var central: CBCentralManager!
@@ -102,6 +114,7 @@ final class DIBSBLEManager: NSObject {
         selectedBoardID = defaults.string(forKey: DefaultsKey.boardID).flatMap(UUID.init)
         selectedBoardName = defaults.string(forKey: DefaultsKey.boardName)
         imuMode = IMUMode(rawValue: UInt8(defaults.integer(forKey: DefaultsKey.imuMode))) ?? .standard
+        phy = RadioPHY(rawValue: UInt8(defaults.integer(forKey: DefaultsKey.phy))) ?? .oneM
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
@@ -171,10 +184,13 @@ final class DIBSBLEManager: NSObject {
             return
         }
         capture = Capture(startedAt: startedAt, boardName: selectedBoardName, spool: spool,
-                          imuMode: imuMode)
+                          imuMode: imuMode, phy: phy)
         isRecording = true
         lastError = nil
-        send([DIBSProtocol.commandStart, imuMode.rawValue])
+        // 2M is the firmware's default: leave the byte out so boards before
+        // firmware 4.1 still start.
+        send(phy == .twoM ? [DIBSProtocol.commandStart, imuMode.rawValue]
+                          : [DIBSProtocol.commandStart, imuMode.rawValue, phy.rawValue])
     }
 
     func stopRecording() {
@@ -297,6 +313,7 @@ final class DIBSBLEManager: NSObject {
             for v in block { sumSquares += Float(v) * Float(v) }
             c.level = (sumSquares / Float(max(block.count, 1))).squareRoot() / 32768
             c.spool.flushIfDue()
+            requestRSSIIfDue(&c)
         }
     }
 
@@ -342,6 +359,7 @@ final class DIBSBLEManager: NSObject {
                         .append("\(packet.accelIndex)\n")
                 }
                 spool.flushIfDue()
+                requestRSSIIfDue(&c)
             }
         } else {
             guard let packet = IMUPacket(data) else { return }
@@ -356,8 +374,18 @@ final class DIBSBLEManager: NSObject {
                         .append("\(packet.seq),\(packet.anchorTicks),\(packet.anchorMicros)\n")
                 }
                 c.spool.flushIfDue()
+                requestRSSIIfDue(&c)
             }
         }
+    }
+
+    /// Asks for the link's RSSI once a second while data arrives (packet
+    /// driven, so it keeps going in the background, unlike a timer).
+    private func requestRSSIIfDue(_ c: inout Capture) {
+        let now = Date()
+        if let last = c.rssiRequestedAt, now.timeIntervalSince(last) < 1 { return }
+        c.rssiRequestedAt = now
+        peripheral?.readRSSI()
     }
 
     private func countIMUPacket(seq: UInt16, in c: inout Capture) {
@@ -505,6 +533,21 @@ extension DIBSBLEManager: CBPeripheralDelegate {
         case DIBSProtocol.statusUUID: handleStatus(data)
         case DIBSProtocol.batteryUUID: battery = DIBSBattery(data)
         default: break
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        let dbm = RSSI.intValue
+        guard error == nil, isRecording, dbm != 127 else { return }  // 127: not available
+        updateCapture { c in
+            c.rssi.append(dbm)
+            // How much data had arrived: audio_samples / sample rate (and the
+            // accel index via imu_accel_timeline.csv) place the reading on
+            // the data's time axis, to within the link's latency.
+            let accel = c.imuMode.isHighRate ? c.hrAccelCount : c.imuSampleCount
+            c.spool.text("rssi.csv", header: "phone_s,rssi_dbm,audio_samples,accel_samples\n")
+                .append(String(format: "%.3f,%d,%d,%d\n", Date().timeIntervalSince(c.startedAt), dbm,
+                               c.audioSampleCount, accel))
         }
     }
 

@@ -45,6 +45,7 @@ static K_SEM_DEFINE(start_sem, 0, 1);
 static atomic_t running;
 static atomic_t end_reason;
 static uint8_t next_mode;
+static uint8_t next_phy = DIBS_PHY_2M;
 static struct dibs_status status;
 
 static void led_off(void)
@@ -90,10 +91,12 @@ static void run(void)
 
 	power_set_recording(true);
 	ble_set_link(status.imu_mode == DIBS_IMU_MODE_STANDARD ? BLE_LINK_FAST : BLE_LINK_FASTEST);
+	ble_set_phy(next_phy);
 	/* Phones take a few seconds to apply new connection parameters; in the
 	 * high-rate modes the slower link would drop packets until then, so
-	 * start the sensors once it is in place (or after 5 s regardless). */
-	if (status.imu_mode != DIBS_IMU_MODE_STANDARD) {
+	 * start the sensors once it is in place (or after 5 s regardless).
+	 * A PHY change is waited for in every mode. */
+	if (status.imu_mode != DIBS_IMU_MODE_STANDARD || ble_phy() != next_phy) {
 		for (int i = 0; i < 100 && !ble_link_ready() && atomic_get(&running); i++) {
 			k_msleep(50);
 		}
@@ -121,6 +124,8 @@ static void run(void)
 	}
 
 	status.state = DIBS_STATE_RECORDING;
+	status.phy = ble_phy();
+	LOG_INF("session PHY %u (asked %u)", status.phy, next_phy);
 	status.pdm_clk_hz = audio_pdm_clk_hz();
 	status.audio_skip = audio_skip_samples();
 	ble_set_status(&status);
@@ -198,7 +203,7 @@ void session_init(uint32_t reset_reason)
 	ble_set_status(&status);
 }
 
-void session_start(uint8_t imu_mode)
+void session_start(uint8_t imu_mode, uint8_t phy)
 {
 	if (battery_is_low()) {
 		LOG_WRN("session refused: battery low");
@@ -209,6 +214,7 @@ void session_start(uint8_t imu_mode)
 	}
 	if (atomic_cas(&running, 0, 1)) {
 		next_mode = imu_mode;
+		next_phy = phy;
 		atomic_set(&end_reason, DIBS_END_NONE);
 		k_sem_give(&start_sem);
 	}

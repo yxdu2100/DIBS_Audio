@@ -176,6 +176,25 @@ hour in high-rate mode) are also kept for the clock fits at Stop. Disk use is
 are valid up to the last flush, but it has no `session.json` or aligned
 files.
 
+`rssi.csv` logs the signal strength at the phone about once a second
+(`phone_s, rssi_dbm, audio_samples, accel_samples`); the sample counts say
+how much data had arrived, so `audio_samples / sampleRateHz` puts each reading
+on the data's `time_s` axis (to within the link's latency). `session.json` →
+`rssi` has the median, min and max. Packet loss that coincides with a drop
+in RSSI is the radio path (distance, body, hand); loss at good RSSI points
+at the phone (busy, background) instead.
+
+### Radio PHY and transmit power
+
+The board transmits at +4 dBm, the nRF52832's maximum: worn against the skin
+the chip antenna loses 10–20 dB. The app's PHY picker (start command byte 3)
+chooses 1M or 2M per session; `session.json` → `blePHY` is the PHY the board
+reported in use. **1M is the default**: on the face, 1M with the standard
+mode (mic + IMU 120 Hz, ~10 kB/s) lost no packets even at low RSSI. High-rate
+mode (~33 kB/s) needs a good link (phone close, same side, Wi-Fi off); check
+its loss per session. Boards on firmware before 4.1 reject a 1M start:
+pick 2M for them (the app then sends the old 2-byte command) or flash them.
+
 ### Robustness
 
 - Task watchdog over the hardware WDT: the system workqueue, the session

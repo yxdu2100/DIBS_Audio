@@ -52,6 +52,13 @@ struct SessionDetailView: View {
                     QualityRow("IMU read errors", m.imu.i2cErrors)
                     FitRow(title: "Audio clock fit", fit: m.audioClockFit)
                     FitRow(title: "IMU clock fit", fit: m.imuClockFit)
+                    if let phy = m.blePHY ?? m.blePHYRequested {
+                        LabeledContent("Radio PHY", value: phy)
+                    }
+                    if let r = m.rssi {
+                        LabeledContent("Signal (RSSI)",
+                                       value: "median \(r.medianDBm) dBm, min \(r.minDBm), max \(r.maxDBm)")
+                    }
                 }
             } else {
                 Section {

@@ -44,6 +44,10 @@
  *                           packets; audio_t0_us stays 0)
  * Audio runs in the first two.
  *
+ * Optional byte 3 of the start command: the radio PHY for the session,
+ * DIBS_PHY_1M or DIBS_PHY_2M (default, also when absent). 1M reaches ~3 dB
+ * further at half the raw bit rate. dibs_status.phy reports the PHY in use.
+ *
  * High-rate IMU packet (flags has DIBS_IMU_FLAG_HIGHRATE):
  *   u16 seq, u8 n_accel, u8 flags, u32 anchor_ts, u32 anchor_us  as above
  *   u32 accel_index  index of this packet's first accel sample, counted from
@@ -68,7 +72,7 @@
 #include <zephyr/sys/util.h>
 
 #define DIBS_PROTOCOL_VERSION 4
-#define DIBS_FW_VERSION       0x0400 /* major.minor */
+#define DIBS_FW_VERSION       0x0401 /* major.minor */
 
 #define DIBS_UUID(n) \
 	BT_UUID_128_ENCODE(0xD1B50000 + (n), 0x6E2B, 0x4C1F, 0x9A7D, 0x3E8B5F0C2A41)
@@ -79,6 +83,9 @@
 #define DIBS_UUID_STATUS  DIBS_UUID(4)
 #define DIBS_UUID_BATTERY DIBS_UUID(5)
 #define DIBS_UUID_IMU     DIBS_UUID(6)
+
+#define DIBS_PHY_1M 1
+#define DIBS_PHY_2M 2
 
 #define DIBS_CMD_STOP  0x00
 #define DIBS_CMD_START 0x01
@@ -141,7 +148,7 @@ struct dibs_status {
 	uint32_t imu_samples;
 	uint16_t imu_i2c_errors; /* failed IMU reads (FIFO rows may be lost) */
 	uint8_t imu_mode;        /* DIBS_IMU_MODE_* of the current/last session */
-	uint8_t reserved;
+	uint8_t phy;             /* DIBS_PHY_* in use (TX), 0 = unknown */
 	uint16_t gyro_odr_hz;    /* gyroscope ODR (nominal) */
 	uint16_t imu_accel_per_ts; /* accel samples per FIFO timestamp */
 } __packed;

@@ -160,6 +160,12 @@ private struct RecordControl: View {
             .pickerStyle(.segmented)
             .disabled(ble.isRecording)
 
+            Picker("PHY", selection: $ble.phy) {
+                ForEach(RadioPHY.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .disabled(ble.isRecording)
+
             Button {
                 ble.isRecording ? ble.stopRecording() : ble.startRecording()
             } label: {
@@ -185,6 +191,10 @@ private struct RecordControl: View {
                         }
                         HStack {
                             Text(String(format: "accel %.0f Hz", capture.imuRateHz))
+                            if let dbm = capture.rssi.last {
+                                Text("\(dbm) dBm")
+                                    .foregroundStyle(dbm < -85 ? .orange : .secondary)
+                            }
                             Spacer()
                             let lost = capture.lostPackets + capture.imuLostPackets
                             Text("lost: audio \(capture.lostPackets), IMU \(capture.imuLostPackets)")

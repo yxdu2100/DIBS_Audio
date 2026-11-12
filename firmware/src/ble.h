@@ -21,6 +21,10 @@ enum ble_link {
 void ble_set_link(enum ble_link link);
 /* The central has applied an interval within the requested link's range. */
 bool ble_link_ready(void);
+/* Asks the phone for this PHY (DIBS_PHY_*); ble_link_ready() waits for it. */
+void ble_set_phy(uint8_t phy);
+/* PHY in use (TX), DIBS_PHY_*, 0 if not connected. */
+uint8_t ble_phy(void);
 
 /* Largest audio notification the current connection can carry (0 if the
  * phone is not connected or not subscribed to audio). */

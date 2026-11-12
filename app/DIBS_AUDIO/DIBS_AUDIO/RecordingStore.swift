@@ -18,6 +18,8 @@ import Foundation
 ///                      linear (np.interp over it gives every sample's time)
 ///   imu_gyro_raw.csv   raw gyroscope samples with their accel index
 ///   imu_fifo_overruns.csv  first accel index after each FIFO overrun (if any)
+///   rssi.csv           signal strength at the phone about once a second, with
+///                      how many audio/accel samples had arrived by then
 ///
 /// The raw files are written while recording (CaptureSpool); a folder that
 /// still holds an INCOMPLETE file was interrupted (app killed or crashed) and
@@ -128,6 +130,19 @@ struct SessionMetadata: Codable {
     var audioClockFit: SessionAligner.Fit?
     /// session_us = offset + slope * IMU tick (unwrapped from the first tick)
     var imuClockFit: SessionAligner.Fit?
+    struct RSSI: Codable {
+        var readings: Int
+        var medianDBm: Int
+        var minDBm: Int
+        var maxDBm: Int
+    }
+
+    /// Radio PHY asked for, and the one the board reported in use ("1M",
+    /// "2M"; absent when unknown).
+    var blePHYRequested: String?
+    var blePHY: String?
+    /// Signal strength at the phone during the session (rssi.csv).
+    var rssi: RSSI?
     /// Constant delay between the microphone and IMU paths, to be measured
     /// with a tap test and subtracted from imu_aligned.csv times.
     var fixedDelayCorrectionMs = 0.0
@@ -248,7 +263,7 @@ final class RecordingStore {
             imuMeta.accelTimestampFit = hr.timeline.fit
             imuMeta.accelTimestampsRejected = hr.timeline.rejected
         }
-        let metadata = SessionMetadata(
+        var metadata = SessionMetadata(
             startedAt: capture.startedAt,
             endedAt: Date(),
             boardID: status.map { String(format: "%016llX", $0.boardID) } ?? "unknown",
@@ -261,6 +276,13 @@ final class RecordingStore {
             imu: imuMeta,
             audioClockFit: audioFit,
             imuClockFit: imuFit)
+        metadata.blePHYRequested = capture.phy.name
+        metadata.blePHY = status.flatMap { RadioPHY(rawValue: $0.phy) }?.name
+        let rssi = capture.rssi.sorted()
+        if let lo = rssi.first, let hi = rssi.last {
+            metadata.rssi = SessionMetadata.RSSI(readings: rssi.count, medianDBm: rssi[rssi.count / 2],
+                                                 minDBm: lo, maxDBm: hi)
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601

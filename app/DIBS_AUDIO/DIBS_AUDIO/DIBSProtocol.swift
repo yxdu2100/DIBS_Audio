@@ -68,6 +68,18 @@ enum IMUMode: UInt8, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Radio PHY for a session (byte 3 of the start command). 1M reaches ~3 dB
+/// further at half the raw bit rate.
+enum RadioPHY: UInt8, CaseIterable, Identifiable {
+    case oneM = 1
+    case twoM = 2
+
+    var id: UInt8 { rawValue }
+    var label: String { self == .oneM ? "1M PHY" : "2M PHY" }
+    /// "1M" / "2M" for session.json.
+    var name: String { self == .oneM ? "1M" : "2M" }
+}
+
 /// Little-endian readers for notification payloads.
 private extension Array where Element == UInt8 {
     func u16(_ i: Int) -> UInt16 { UInt16(self[i]) | UInt16(self[i + 1]) << 8 }
@@ -109,6 +121,9 @@ struct DIBSStatus: Equatable, Codable {
     var gyroODRHz: Int
     /// Accelerometer samples per FIFO timestamp (1 in standard mode).
     var imuAccelPerTimestamp: Int
+    /// PHY in use during the session (RadioPHY raw value), 0 = unknown
+    /// (firmware before 4.1).
+    var phy: UInt8
 
     static let length = 56
 
@@ -144,6 +159,7 @@ struct DIBSStatus: Equatable, Codable {
         imuMode = IMUMode(rawValue: b[50]) ?? .standard
         gyroODRHz = Int(b.u16(52))
         imuAccelPerTimestamp = Int(b.u16(54))
+        phy = b[51]
     }
 }
 
