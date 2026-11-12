@@ -130,7 +130,7 @@ int audio_begin(void)
 
 int audio_process_block(void)
 {
-	static uint8_t pkt[247];
+	static uint8_t scratch[BLE_TX_MAX_LEN];
 	void *buf;
 	size_t size;
 	int err = dmic_read(mic, 0, &buf, &size, 200);
@@ -154,19 +154,23 @@ int audio_process_block(void)
 
 	/* Split the block into packets that fit the current MTU. */
 	size_t max_samp = MIN((ble_audio_max_len() - DIBS_AUDIO_HDR_LEN) * 2,
-			      (sizeof(pkt) - DIBS_AUDIO_HDR_LEN) * 2) & ~1U;
+			      (BLE_TX_MAX_LEN - DIBS_AUDIO_HDR_LEN) * 2) & ~1U;
 
 	for (size_t off = 0; off < n; off += max_samp) {
 		size_t cnt = MIN(max_samp, n - off);
+		uint8_t *pkt = ble_tx_alloc(BLE_CHAN_AUDIO);
+		/* A dropped packet is still encoded: the ADPCM state must move on
+		 * and its seq number tells the phone it is missing. */
+		uint8_t *p = pkt ? pkt : scratch;
 
-		sys_put_le16(stats.packets++, &pkt[0]);
-		sys_put_le16((uint16_t)adpcm.predictor, &pkt[2]);
-		pkt[4] = adpcm.index;
-		sys_put_le32(off + cnt == n ? end_us : 0, &pkt[5]);
-		adpcm_encode(&adpcm, &s[off], cnt, &pkt[DIBS_AUDIO_HDR_LEN]);
+		sys_put_le16(stats.packets++, &p[0]);
+		sys_put_le16((uint16_t)adpcm.predictor, &p[2]);
+		p[4] = adpcm.index;
+		sys_put_le32(off + cnt == n ? end_us : 0, &p[5]);
+		adpcm_encode(&adpcm, &s[off], cnt, &p[DIBS_AUDIO_HDR_LEN]);
 
-		if (ble_send_audio(pkt, DIBS_AUDIO_HDR_LEN + cnt / 2)) {
-			stats.dropped++;
+		if (pkt) {
+			ble_tx_submit(BLE_CHAN_AUDIO, pkt, DIBS_AUDIO_HDR_LEN + cnt / 2);
 		}
 	}
 	k_mem_slab_free(&mic_slab, buf);
@@ -181,7 +185,8 @@ void audio_end(struct audio_stats *out)
 	mic_configure(0);
 	nrf_gpio_pin_clear(MIC_CLK_PIN);
 	nrf_gpio_cfg_output(MIC_CLK_PIN);
-	LOG_INF("audio stopped: %u packets, %u dropped", stats.packets, stats.dropped);
+	stats.dropped = ble_tx_dropped(BLE_CHAN_AUDIO);
+	LOG_INF("audio stopped: %u packets, %u dropped so far", stats.packets, stats.dropped);
 	if (out) {
 		*out = stats;
 	}

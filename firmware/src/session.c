@@ -44,6 +44,7 @@ static K_TIMER_DEFINE(led_timer, led_blink, NULL);
 static K_SEM_DEFINE(start_sem, 0, 1);
 static atomic_t running;
 static atomic_t end_reason;
+static uint8_t next_mode;
 static struct dibs_status status;
 
 static void led_off(void)
@@ -51,6 +52,20 @@ static void led_off(void)
 	k_timer_stop(&led_timer);
 	led_on = false;
 	gpio_pin_set_dt(&led, 0);
+}
+
+static void set_mode(uint8_t mode)
+{
+	struct imu_mode_info info;
+
+	if (imu_mode_get(mode, &info)) {
+		mode = DIBS_IMU_MODE_STANDARD;
+		imu_mode_get(mode, &info);
+	}
+	status.imu_mode = mode;
+	status.imu_odr_hz = info.accel_odr_hz;
+	status.gyro_odr_hz = info.gyro_odr_hz;
+	status.imu_accel_per_ts = info.accel_per_ts;
 }
 
 static void run(void)
@@ -69,15 +84,27 @@ static void run(void)
 	status.imu_overruns = 0;
 	status.imu_samples = 0;
 	status.imu_i2c_errors = 0;
+	set_mode(next_mode);
+	ble_tx_reset();
+	bool with_audio = status.imu_mode != DIBS_IMU_MODE_HIGHRATE_IMU_ONLY;
 
 	power_set_recording(true);
-	ble_set_link_fast(true);
+	ble_set_link(status.imu_mode == DIBS_IMU_MODE_STANDARD ? BLE_LINK_FAST : BLE_LINK_FASTEST);
+	/* Phones take a few seconds to apply new connection parameters; in the
+	 * high-rate modes the slower link would drop packets until then, so
+	 * start the sensors once it is in place (or after 5 s regardless). */
+	if (status.imu_mode != DIBS_IMU_MODE_STANDARD) {
+		for (int i = 0; i < 100 && !ble_link_ready() && atomic_get(&running); i++) {
+			k_msleep(50);
+		}
+		LOG_INF("link %s", ble_link_ready() ? "ready" : "not at the requested interval");
+	}
 	err = timebase_start();
 	if (!err) {
 		timebase_arm_pdm_capture();
-		err = imu_start();
+		err = imu_start(status.imu_mode);
 	}
-	if (!err) {
+	if (!err && with_audio) {
 		err = audio_begin();
 	}
 	if (err) {
@@ -88,7 +115,7 @@ static void run(void)
 		status.state = DIBS_STATE_IDLE;
 		status.end_reason = DIBS_END_ERROR;
 		ble_set_status(&status);
-		ble_set_link_fast(false);
+		ble_set_link(BLE_LINK_IDLE);
 		power_set_recording(false);
 		return;
 	}
@@ -103,6 +130,11 @@ static void run(void)
 	wdt = task_wdt_add(WDT_TIMEOUT_MS, NULL, NULL);
 	while (atomic_get(&running)) {
 		task_wdt_feed(wdt);
+		if (!with_audio) {
+			/* The IMU thread does the work; just watch for the stop. */
+			k_msleep(50);
+			continue;
+		}
 		err = audio_process_block();
 		if (err) {
 			LOG_WRN("PDM read: %d", err);
@@ -117,20 +149,23 @@ static void run(void)
 	}
 
 	task_wdt_delete(wdt);
-	audio_end(&as);
+	if (with_audio) {
+		audio_end(&as);
+	}
 	imu_stop(&is);
 	led_off();
 
 	status.state = DIBS_STATE_IDLE;
 	status.end_reason = atomic_get(&end_reason);
-	status.audio_dropped = as.dropped;
+	/* imu_stop() waited for the send queue: these counts are final. */
+	status.audio_dropped = ble_tx_dropped(BLE_CHAN_AUDIO);
 	status.imu_dropped = is.dropped_packets;
 	status.imu_overruns = is.overruns;
 	status.imu_samples = is.samples;
 	status.imu_i2c_errors = is.i2c_errors;
 	ble_set_status(&status);
 	timebase_stop();
-	ble_set_link_fast(false);
+	ble_set_link(BLE_LINK_IDLE);
 	power_set_recording(false);
 	LOG_INF("session %08x ended (reason %u)", status.session_id, status.end_reason);
 }
@@ -155,7 +190,7 @@ void session_init(uint32_t reset_reason)
 	status.board_id_hi = NRF_FICR->DEVICEID[1];
 	status.reset_reason = reset_reason;
 	status.imu_freq_fine = imu_freq_fine();
-	status.imu_odr_hz = IMU_ODR_HZ;
+	set_mode(DIBS_IMU_MODE_STANDARD);
 	status.accel_ug_lsb = IMU_ACCEL_UG_LSB;
 	status.gyro_mdps_lsb = IMU_GYRO_MDPS_LSB;
 	status.pdm_clk_hz = audio_pdm_clk_hz();
@@ -163,7 +198,7 @@ void session_init(uint32_t reset_reason)
 	ble_set_status(&status);
 }
 
-void session_start(void)
+void session_start(uint8_t imu_mode)
 {
 	if (battery_is_low()) {
 		LOG_WRN("session refused: battery low");
@@ -173,6 +208,7 @@ void session_start(void)
 		return;
 	}
 	if (atomic_cas(&running, 0, 1)) {
+		next_mode = imu_mode;
 		atomic_set(&end_reason, DIBS_END_NONE);
 		k_sem_give(&start_sem);
 	}

@@ -34,13 +34,18 @@ static struct dibs_battery battery = { .version = 1 };
 static ssize_t control_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			     const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
-	if (offset != 0 || len != 1) {
+	const uint8_t *cmd = buf;
+
+	if (offset != 0 || len < 1 || len > 2) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
-	switch (((const uint8_t *)buf)[0]) {
+	switch (cmd[0]) {
 	case DIBS_CMD_START:
-		session_start();
+		if (len == 2 && cmd[1] > DIBS_IMU_MODE_HIGHRATE_IMU_ONLY) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		session_start(len == 2 ? cmd[1] : DIBS_IMU_MODE_STANDARD);
 		break;
 	case DIBS_CMD_STOP:
 		session_stop(DIBS_END_STOP);
@@ -134,13 +139,20 @@ static const struct bt_le_adv_param *adv_param =
 
 /* Units: interval 1.25 ms, timeout 10 ms. Idle: 30-45 ms with latency 20,
  * so with nothing to send the board wakes about once a second. Recording:
- * 15-30 ms without latency for the audio + IMU stream. Both fit Apple's
- * rules (multiples of 15 ms, latency <= 30, timeout 6 s). */
-static const struct bt_le_conn_param idle_link = BT_LE_CONN_PARAM_INIT(24, 36, 20, 600);
-static const struct bt_le_conn_param fast_link = BT_LE_CONN_PARAM_INIT(12, 24, 0, 600);
+ * 15-30 ms without latency for the audio + IMU stream; high-rate IMU asks
+ * for 15 ms (a Mac sends only ~2 packets per connection event, so the
+ * centrals' usual 30 ms choice carries half the ~150 packets/s). All fit
+ * Apple's rules (multiples of 15 ms, latency <= 30, timeout 6 s). */
+static const struct bt_le_conn_param links[] = {
+	[BLE_LINK_IDLE] = BT_LE_CONN_PARAM_INIT(24, 36, 20, 600),
+	[BLE_LINK_FAST] = BT_LE_CONN_PARAM_INIT(12, 24, 0, 600),
+	[BLE_LINK_FASTEST] = BT_LE_CONN_PARAM_INIT(12, 12, 0, 600),
+};
 
 static atomic_t adv_allowed = ATOMIC_INIT(1);
-static atomic_t fast_link_wanted;
+static atomic_t link_wanted = ATOMIC_INIT(BLE_LINK_IDLE);
+/* Current connection interval, 1.25 ms units (0: not connected). */
+static atomic_t link_interval;
 
 static void advertise(void)
 {
@@ -172,7 +184,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	current_conn = bt_conn_ref(conn);
 	power_set_connected(true);
 
-	bt_conn_le_param_update(conn, atomic_get(&fast_link_wanted) ? &fast_link : &idle_link);
+	struct bt_conn_info info;
+
+	if (bt_conn_get_info(conn, &info) == 0) {
+		atomic_set(&link_interval, info.le.interval);
+	}
+
+	bt_conn_le_param_update(conn, &links[atomic_get(&link_wanted)]);
 	/* 2M PHY and 251-byte data length are negotiated by the host
 	 * automatically (BT_AUTO_PHY_UPDATE, BT_AUTO_DATA_LEN_UPDATE). Don't
 	 * request them here: this callback runs on the thread that has to
@@ -191,6 +209,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
+	atomic_set(&link_interval, 0);
 	power_set_connected(false);
 }
 
@@ -202,6 +221,7 @@ static void recycled(void)
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
 			     uint16_t latency, uint16_t timeout)
 {
+	atomic_set(&link_interval, interval);
 	LOG_INF("conn interval %u.%02u ms", interval * 125 / 100, interval * 125 % 100);
 }
 
@@ -259,11 +279,17 @@ void ble_set_advertising(bool allowed)
 	}
 }
 
-void ble_set_link_fast(bool fast)
+bool ble_link_ready(void)
 {
-	atomic_set(&fast_link_wanted, fast);
+	return current_conn &&
+	       atomic_get(&link_interval) <= links[atomic_get(&link_wanted)].interval_max;
+}
+
+void ble_set_link(enum ble_link link)
+{
+	atomic_set(&link_wanted, link);
 	if (current_conn) {
-		bt_conn_le_param_update(current_conn, fast ? &fast_link : &idle_link);
+		bt_conn_le_param_update(current_conn, &links[link]);
 	}
 }
 
@@ -275,24 +301,96 @@ size_t ble_audio_max_len(void)
 	return bt_gatt_get_mtu(current_conn) - 3;
 }
 
-int ble_send_audio(const uint8_t *data, size_t len)
+static int notify(enum ble_chan chan, const uint8_t *data, size_t len)
 {
-	if (!current_conn || !audio_subscribed) {
-		return -ENOTCONN;
-	}
-	return bt_gatt_notify(current_conn, &dibs_svc.attrs[ATTR_AUDIO], data, len);
-}
+	bool subscribed = chan == BLE_CHAN_AUDIO ? audio_subscribed : imu_subscribed;
 
-int ble_send_imu(const uint8_t *data, size_t len)
-{
-	if (!current_conn || !imu_subscribed) {
+	if (!current_conn || !subscribed) {
 		return -ENOTCONN;
 	}
 	if (len > bt_gatt_get_mtu(current_conn) - 3) {
 		return -EMSGSIZE;
 	}
-	return bt_gatt_notify(current_conn, &dibs_svc.attrs[ATTR_IMU], data, len);
+	return bt_gatt_notify(current_conn,
+			      &dibs_svc.attrs[chan == BLE_CHAN_AUDIO ? ATTR_AUDIO : ATTR_IMU],
+			      data, len);
 }
+
+/* ~200 ms of audio + high-rate IMU (~150 packets/s). */
+#define TX_BLOCK 248
+#define TX_COUNT 28
+
+struct tx_item {
+	uint8_t *buf;
+	uint16_t len;
+	uint8_t chan;
+};
+
+K_MEM_SLAB_DEFINE_STATIC(tx_slab, TX_BLOCK, TX_COUNT, 4);
+K_MSGQ_DEFINE(tx_q, sizeof(struct tx_item), TX_COUNT, 4);
+static atomic_t tx_busy;
+static atomic_t tx_dropped[BLE_CHAN_COUNT];
+
+uint8_t *ble_tx_alloc(enum ble_chan chan)
+{
+	void *buf;
+
+	if (k_mem_slab_alloc(&tx_slab, &buf, K_NO_WAIT)) {
+		atomic_inc(&tx_dropped[chan]);
+		return NULL;
+	}
+	return buf;
+}
+
+void ble_tx_submit(enum ble_chan chan, uint8_t *buf, size_t len)
+{
+	struct tx_item item = { .buf = buf, .len = len, .chan = chan };
+
+	if (k_msgq_put(&tx_q, &item, K_NO_WAIT)) {
+		atomic_inc(&tx_dropped[chan]);
+		k_mem_slab_free(&tx_slab, buf);
+	}
+}
+
+uint16_t ble_tx_dropped(enum ble_chan chan)
+{
+	return atomic_get(&tx_dropped[chan]);
+}
+
+void ble_tx_reset(void)
+{
+	for (int i = 0; i < BLE_CHAN_COUNT; i++) {
+		atomic_set(&tx_dropped[i], 0);
+	}
+}
+
+void ble_tx_wait_idle(int timeout_ms)
+{
+	for (int t = 0; t < timeout_ms; t += 10) {
+		if (k_msgq_num_used_get(&tx_q) == 0 && !atomic_get(&tx_busy)) {
+			return;
+		}
+		k_msleep(10);
+	}
+}
+
+static void tx_thread(void *p1, void *p2, void *p3)
+{
+	struct tx_item item;
+
+	for (;;) {
+		k_msgq_get(&tx_q, &item, K_FOREVER);
+		atomic_set(&tx_busy, 1);
+		if (notify(item.chan, item.buf, item.len)) {
+			atomic_inc(&tx_dropped[item.chan]);
+		}
+		k_mem_slab_free(&tx_slab, item.buf);
+		atomic_set(&tx_busy, 0);
+	}
+}
+
+/* Below the session (5) and IMU (6) threads: producing data comes first. */
+K_THREAD_DEFINE(ble_tx_tid, 1536, tx_thread, NULL, NULL, NULL, 7, 0, 0);
 
 void ble_set_status(const struct dibs_status *s)
 {

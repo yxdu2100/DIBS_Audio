@@ -1,9 +1,10 @@
 /*
- * DIBS BLE protocol v3, shared with app/DIBS_AUDIO/DIBS_AUDIO/DIBSProtocol.swift.
+ * DIBS BLE protocol v4, shared with app/DIBS_AUDIO/DIBS_AUDIO/DIBSProtocol.swift.
  *
  * Service   D1B50001-6E2B-4C1F-9A7D-3E8B5F0C2A41
- *   Control D1B50002-...  write:  0x01 start session, 0x00 stop,
+ *   Control D1B50002-...  write:  0x01 [mode] start session, 0x00 stop,
  *                                 0x02 shut down for storage (DIBS_CMD_SHIP)
+ *                                 mode: DIBS_IMU_MODE_*, 0 if omitted
  *   Audio   D1B50003-...  notify: audio packets (below)
  *   Status  D1B50004-...  read/notify: struct dibs_status
  *   Battery D1B50005-...  read/notify: struct dibs_battery, every 5 s on change
@@ -36,6 +37,28 @@
  *                  axes raw, scaled by the status fields
  * The phone fits session_us = a + b * imu_ticks over all anchors.
  *
+ * Modes (byte 2 of the start command, reported in dibs_status.imu_mode):
+ *   DIBS_IMU_MODE_STANDARD  accel + gyro 120 Hz, packets above
+ *   DIBS_IMU_MODE_HIGHRATE  accel 3840 Hz + gyro 240 Hz, packets below
+ *   DIBS_IMU_MODE_HIGHRATE_IMU_ONLY  as HIGHRATE, microphone off (no audio
+ *                           packets; audio_t0_us stays 0)
+ * Audio runs in the first two.
+ *
+ * High-rate IMU packet (flags has DIBS_IMU_FLAG_HIGHRATE):
+ *   u16 seq, u8 n_accel, u8 flags, u32 anchor_ts, u32 anchor_us  as above
+ *   u32 accel_index  index of this packet's first accel sample, counted from
+ *                    0 at session start over every sample the FIFO delivered
+ *                    (samples lost in a FIFO overrun are not counted)
+ *   u8  n_gyro
+ *   u8  n_ts
+ *   n_accel x { i16 ax, ay, az }                     consecutive samples
+ *   n_gyro  x { i16 rel, i16 gx, gy, gz }
+ *   n_ts    x { i16 rel, u32 ts }
+ *                    rel: accel_index + rel is the accel sample of the same
+ *                    FIFO time slot (may be -1 or past this packet's last)
+ * The FIFO stores one IMU timestamp every dibs_status.imu_accel_per_ts accel
+ * samples; the phone interpolates the accel sample times between them.
+ *
  * All integers are little-endian.
  */
 #ifndef DIBS_PROTOCOL_H_
@@ -44,8 +67,8 @@
 #include <stdint.h>
 #include <zephyr/sys/util.h>
 
-#define DIBS_PROTOCOL_VERSION 3
-#define DIBS_FW_VERSION       0x0300 /* major.minor */
+#define DIBS_PROTOCOL_VERSION 4
+#define DIBS_FW_VERSION       0x0400 /* major.minor */
 
 #define DIBS_UUID(n) \
 	BT_UUID_128_ENCODE(0xD1B50000 + (n), 0x6E2B, 0x4C1F, 0x9A7D, 0x3E8B5F0C2A41)
@@ -70,6 +93,18 @@
 #define DIBS_IMU_MAX_SAMPLES  14
 #define DIBS_IMU_FLAG_ANCHOR  BIT(0) /* anchor_ts/anchor_us are fresh */
 #define DIBS_IMU_FLAG_OVERRUN BIT(1) /* IMU FIFO overflowed before this packet */
+#define DIBS_IMU_FLAG_HIGHRATE BIT(7) /* high-rate packet layout */
+
+#define DIBS_IMU_MODE_STANDARD 0
+#define DIBS_IMU_MODE_HIGHRATE 1
+#define DIBS_IMU_MODE_HIGHRATE_IMU_ONLY 2
+
+#define DIBS_IMU_HR_HDR_LEN   18
+#define DIBS_IMU_HR_ACCEL_LEN 6
+#define DIBS_IMU_HR_GYRO_LEN  8
+#define DIBS_IMU_HR_TS_LEN    6
+/* Largest notification: ATT MTU 247 - 3. */
+#define DIBS_IMU_HR_MAX_LEN   244
 
 enum dibs_state {
 	DIBS_STATE_IDLE = 0,
@@ -98,14 +133,17 @@ struct dibs_status {
 	uint32_t pdm_clk_hz;     /* audio sample rate = pdm_clk_hz / 64 */
 	uint32_t audio_t0_us;    /* session clock when the PDM started; 0 = unknown */
 	uint16_t audio_dropped;  /* audio packets the board could not send */
-	uint16_t imu_odr_hz;
+	uint16_t imu_odr_hz;     /* accelerometer ODR (nominal) */
 	uint16_t accel_ug_lsb;
 	uint16_t gyro_mdps_lsb;
 	uint16_t imu_dropped;    /* IMU packets the board could not send */
 	uint16_t imu_overruns;   /* IMU FIFO overflows */
 	uint32_t imu_samples;
 	uint16_t imu_i2c_errors; /* failed IMU reads (FIFO rows may be lost) */
-	uint16_t reserved;
+	uint8_t imu_mode;        /* DIBS_IMU_MODE_* of the current/last session */
+	uint8_t reserved;
+	uint16_t gyro_odr_hz;    /* gyroscope ODR (nominal) */
+	uint16_t imu_accel_per_ts; /* accel samples per FIFO timestamp */
 } __packed;
 
 enum dibs_charge {
